@@ -1,40 +1,20 @@
 /* Rax -- A radix tree implementation.
  *
- * Copyright (c) 2017, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2017-Present, Redis Ltd.
  * All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *   * Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in the
- *     documentation and/or other materials provided with the distribution.
- *   * Neither the name of Redis nor the names of its contributors may be used
- *     to endorse or promote products derived from this software without
- *     specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * Licensed under your choice of (a) the Redis Source Available License 2.0
+ * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+ * GNU Affero General Public License v3 (AGPLv3).
  */
 
 #include <stdlib.h>
 #include <string.h>
-#include <assert.h>
 #include <stdio.h>
 #include <errno.h>
 #include <math.h>
 #include "rax.h"
+#include "redisassert.h"
 
 #ifndef RAX_MALLOC_INCLUDE
 #define RAX_MALLOC_INCLUDE "rax_malloc.h"
@@ -42,29 +22,38 @@
 
 #include RAX_MALLOC_INCLUDE
 
-/* This is a special pointer that is guaranteed to never have the same value
- * of a radix tree node. It's used in order to report "not found" error without
- * requiring the function to have multiple return values. */
-void *raxNotFound = (void*)"rax-not-found-pointer";
-
 /* -------------------------------- Debugging ------------------------------ */
 
 void raxDebugShowNode(const char *msg, raxNode *n);
 
-/* Turn debugging messages on/off. */
-#if 0
+/* Turn debugging messages on/off by compiling with RAX_DEBUG_MSG macro on.
+ * When RAX_DEBUG_MSG is defined by default Rax operations will emit a lot
+ * of debugging info to the standard output, however you can still turn
+ * debugging on/off in order to enable it only when you suspect there is an
+ * operation causing a bug using the function raxSetDebugMsg(). */
+#ifdef RAX_DEBUG_MSG
 #define debugf(...)                                                            \
-    do {                                                                       \
-        printf("%s:%s:%d:\t", __FILE__, __FUNCTION__, __LINE__);               \
+    if (raxDebugMsg) {                                                         \
+        printf("%s:%s:%d:\t", __FILE__, __func__, __LINE__);                   \
         printf(__VA_ARGS__);                                                   \
         fflush(stdout);                                                        \
-    } while (0);
+    }
 
 #define debugnode(msg,n) raxDebugShowNode(msg,n)
 #else
 #define debugf(...)
 #define debugnode(msg,n)
 #endif
+
+/* By default log debug info if RAX_DEBUG_MSG is defined. */
+static int raxDebugMsg = 1;
+
+/* When debug messages are enabled, turn them on/off dynamically. By
+ * default they are enabled. Set the state to 0 to disable, and 1 to
+ * re-enable. */
+void raxSetDebugMsg(int onoff) {
+    raxDebugMsg = onoff;
+}
 
 /* ------------------------- raxStack functions --------------------------
  * The raxStack is a simple stack of pointers that is capable of switching
@@ -131,35 +120,95 @@ static inline void raxStackFree(raxStack *ts) {
 }
 
 /* ----------------------------------------------------------------------------
- * Radis tree implementation
+ * Radix tree implementation
  * --------------------------------------------------------------------------*/
 
+/* Return the padding needed in the characters section of a node having size
+ * 'nodesize'. The padding is needed to store the child pointers to aligned
+ * addresses. Note that we add 4 to the node size because the node has a four
+ * bytes header. */
+#define raxPadding(nodesize) ((sizeof(void*)-(((nodesize)+4) % sizeof(void*))) & (sizeof(void*)-1))
+
+/* Return the pointer to the last child pointer in a node. For the compressed
+ * nodes this is the only child pointer. */
+#define raxNodeLastChildPtr(n) ((raxNode**) ( \
+    ((char*)(n)) + \
+    raxNodeCurrentLength(n) - \
+    sizeof(raxNode*) - \
+    (((n)->iskey && !(n)->isnull) ? sizeof(void*) : 0) \
+))
+
+/* Return the pointer to the first child pointer. */
+#define raxNodeFirstChildPtr(n) ((raxNode**) ( \
+    (n)->data + \
+    (n)->size + \
+    raxPadding((n)->size)))
+
+/* Return the current total size of the node. Note that the second line
+ * computes the padding after the string of characters, needed in order to
+ * save pointers to aligned addresses. */
+#define raxNodeCurrentLength(n) ( \
+    sizeof(raxNode)+(n)->size+ \
+    raxPadding((n)->size)+ \
+    ((n)->iscompr ? sizeof(raxNode*) : sizeof(raxNode*)*(n)->size)+ \
+    (((n)->iskey && !(n)->isnull)*sizeof(void*)) \
+)
+
 /* Allocate a new non compressed node with the specified number of children.
- * If datafiled is true, the allocation is made large enough to hold the
+ * If datafield is true, the allocation is made large enough to hold the
  * associated data pointer.
  * Returns the new node pointer. On out of memory NULL is returned. */
-raxNode *raxNewNode(size_t children, int datafield) {
-    size_t nodesize = sizeof(raxNode)+children+
+raxNode *raxNewNode(rax *rax, size_t children, int datafield) {
+    size_t nodesize = sizeof(raxNode)+children+raxPadding(children)+
                       sizeof(raxNode*)*children;
     if (datafield) nodesize += sizeof(void*);
-    raxNode *node = rax_malloc(nodesize);
+    size_t usable;
+    raxNode *node = rax_malloc_usable(nodesize,&usable);
     if (node == NULL) return NULL;
     node->iskey = 0;
     node->isnull = 0;
     node->iscompr = 0;
     node->size = children;
+    if (rax->alloc_size) *rax->alloc_size += usable;
     return node;
+}
+
+/* Deallocate node */
+void raxFreeNode(rax *rax, raxNode *n) {
+    size_t usable;
+    rax_free_usable(n, &usable);
+    if (rax->alloc_size) *rax->alloc_size -= usable;
+}
+
+/* Bytes consumed descending one step from `n` toward a child: the whole
+ * compressed string for a compressed node, or a single edge byte otherwise. */
+static inline int raxStepLenNode(const raxNode *n) {
+    return n->iscompr ? (int)n->size : 1;
 }
 
 /* Allocate a new rax and return its pointer. On out of memory the function
  * returns NULL. */
 rax *raxNew(void) {
-    rax *rax = rax_malloc(sizeof(*rax));
+    return raxNewEx(0, NULL, 0);
+}
+
+/* Common rax constructor
+ *  alloc_size - if non-NULL, rax will account for its used memory at this location
+ *  keyFixedLen - if > 0, rax will enable the leaf-inlining path and assert every
+ *                insert/remove uses exactly `keyFixedLen` bytes. */
+rax *raxNewEx(int metaSize, size_t *alloc_size, uint32_t keyFixedLen) {
+    size_t usable;
+    assert(keyFixedLen <= RAX_NODE_MAX_SIZE);
+    rax *rax = rax_malloc_usable(sizeof(*rax) + metaSize, &usable);
     if (rax == NULL) return NULL;
     rax->numele = 0;
     rax->numnodes = 1;
-    rax->head = raxNewNode(0,0);
+    rax->alloc_size = alloc_size;
+    rax->keyFixedLen = keyFixedLen;
+    if (rax->alloc_size) *rax->alloc_size += usable;
+    rax->head = raxNewNode(rax, 0, 0);
     if (rax->head == NULL) {
+        if (rax->alloc_size) *rax->alloc_size -= usable;
         rax_free(rax);
         return NULL;
     } else {
@@ -167,23 +216,28 @@ rax *raxNew(void) {
     }
 }
 
-/* Return the current total size of the node. */
-#define raxNodeCurrentLength(n) ( \
-    sizeof(raxNode)+(n)->size+ \
-    ((n)->iscompr ? sizeof(raxNode*) : sizeof(raxNode*)*(n)->size)+ \
-    (((n)->iskey && !(n)->isnull)*sizeof(void*)) \
-)
+/* realloc the node to have 'newsize'. On out of memory NULL is returned. */
+raxNode *raxNodeRealloc(rax *rax, raxNode *n, size_t newsize) {
+    size_t usable, old_usable;
+    raxNode *newn = rax_realloc_usable(n,newsize,&usable,&old_usable);
+    if (newn == NULL) return NULL;
+    if (rax->alloc_size) {
+        *rax->alloc_size -= old_usable;
+        *rax->alloc_size += usable;
+    }
+    return newn;
+}
 
 /* realloc the node to make room for auxiliary data in order
  * to store an item in that node. On out of memory NULL is returned. */
-raxNode *raxReallocForData(raxNode *n, void *data) {
+raxNode *raxReallocForData(rax *rax, raxNode *n, void *data) {
     if (data == NULL) return n; /* No reallocation needed, setting isnull=1 */
     size_t curlen = raxNodeCurrentLength(n);
-    return rax_realloc(n,curlen+sizeof(void*));
+    return raxNodeRealloc(rax,n,curlen+sizeof(void*));
 }
 
 /* Set the node auxiliary data to the specified pointer. */
-void raxSetData(raxNode *n, void *data) {
+static inline void raxSetData(raxNode *n, void *data) {
     n->iskey = 1;
     if (data != NULL) {
         n->isnull = 0;
@@ -213,93 +267,318 @@ void *raxGetData(raxNode *n) {
  * On success the new parent node pointer is returned (it may change because
  * of the realloc, so the caller should discard 'n' and use the new value).
  * On out of memory NULL is returned, and the old node is still valid. */
-raxNode *raxAddChild(raxNode *n, unsigned char c, raxNode **childptr, raxNode ***parentlink) {
+raxNode *raxAddChild(rax *rax, raxNode *n, unsigned char c, raxNode **childptr, raxNode ***parentlink) {
     assert(n->iscompr == 0);
 
-    size_t curlen = sizeof(raxNode)+
-                    n->size+
-                    sizeof(raxNode*)*n->size;
-    size_t newlen;
+    size_t curlen = raxNodeCurrentLength(n);
+    n->size++;
+    size_t newlen = raxNodeCurrentLength(n);
+    n->size--; /* For now restore the original size. We'll update it only on
+                  success at the end. */
 
     /* Alloc the new child we will link to 'n'. */
-    raxNode *child = raxNewNode(0,0);
+    raxNode *child = raxNewNode(rax,0,0);
     if (child == NULL) return NULL;
 
-    /* Make space in the original node. */
-    if (n->iskey) curlen += sizeof(void*);
-    newlen = curlen+sizeof(raxNode*)+1; /* Add 1 char and 1 pointer. */
-    raxNode *newn = rax_realloc(n,newlen);
-    if (newn == NULL) {
-        rax_free(child);
-        return NULL;
+    /* Make space in the original node. If the current allocation already
+     * has enough usable bytes (common with jemalloc size-class rounding),
+     * skip the realloc entirely. */
+    if (rax_malloc_usable_size(n) < newlen) {
+        raxNode *newn = raxNodeRealloc(rax,n,newlen);
+        if (newn == NULL) {
+            raxFreeNode(rax,child);
+            return NULL;
+        }
+        n = newn;
     }
-    n = newn;
 
-    /* After the reallocation, we have 5/9 (depending on the system
-     * pointer size) bytes at the end, that is, the additional char
-     * in the 'data' section, plus one pointer to the new child:
+    /* After the reallocation, we have up to 8/16 (depending on the system
+     * pointer size, and the required node padding) bytes at the end, that is,
+     * the additional char in the 'data' section, plus one pointer to the new
+     * child, plus the padding needed in order to store addresses into aligned
+     * locations.
      *
-     * [numc][abx][ap][bp][xp]|auxp|.....
+     * So if we start with the following node, having "abde" edges.
+     *
+     * Note:
+     * - We assume 4 bytes pointer for simplicity.
+     * - Each space below corresponds to one byte
+     *
+     * [HDR*][abde][Aptr][Bptr][Dptr][Eptr]|AUXP|
+     *
+     * After the reallocation we need: 1 byte for the new edge character
+     * plus 4 bytes for a new child pointer (assuming 32 bit machine).
+     * However after adding 1 byte to the edge char, the header + the edge
+     * characters are no longer aligned, so we also need 3 bytes of padding.
+     * In total the reallocation will add 1+4+3 bytes = 8 bytes:
+     *
+     * (Blank bytes are represented by ".")
+     *
+     * [HDR*][abde][Aptr][Bptr][Dptr][Eptr]|AUXP|[....][....]
      *
      * Let's find where to insert the new child in order to make sure
-     * it is inserted in-place lexicographically. */
+     * it is inserted in-place lexicographically. Assuming we are adding
+     * a child "c" in our case pos will be = 2 after the end of the following
+     * loop. */
     int pos;
-    for (pos = 0; pos < n->size; pos++) {
-        if (n->data[pos] > c) break;
+    if (n->size > 0 && c > n->data[n->size - 1]) {
+        pos = n->size;
+    } else {
+        for (pos = 0; pos < n->size; pos++) {
+            if (n->data[pos] > c) break;
+        }
     }
 
     /* Now, if present, move auxiliary data pointer at the end
      * so that we can mess with the other data without overwriting it.
      * We will obtain something like that:
      *
-     * [numc][abx][ap][bp][xp].....|auxp| */
-    unsigned char *src;
+     * [HDR*][abde][Aptr][Bptr][Dptr][Eptr][....][....]|AUXP|
+     */
+    unsigned char *src, *dst;
     if (n->iskey && !n->isnull) {
-        src = n->data+n->size+sizeof(raxNode*)*n->size;
-        memmove(src+1+sizeof(raxNode*),src,sizeof(void*));
+        src = ((unsigned char*)n+curlen-sizeof(void*));
+        dst = ((unsigned char*)n+newlen-sizeof(void*));
+        memmove(dst,src,sizeof(void*));
     }
 
-    /* Now imagine we are adding a node with edge 'c'. The insertion
-     * point is between 'b' and 'x', so the 'pos' variable value is
-     * To start, move all the child pointers after the insertion point
-     * of 1+sizeof(pointer) bytes on the right, to obtain:
+    /* Compute the "shift", that is, how many bytes we need to move the
+     * pointers section forward because of the addition of the new child
+     * byte in the string section. Note that if we had no padding, that
+     * would be always "1", since we are adding a single byte in the string
+     * section of the node (where now there is "abde" basically).
      *
-     * [numc][abx][ap][bp].....[xp]|auxp| */
-    src = n->data+n->size+sizeof(raxNode*)*pos;
-    memmove(src+1+sizeof(raxNode*),src,sizeof(raxNode*)*(n->size-pos));
+     * However we have padding, so it could be zero, or up to 8.
+     *
+     * Another way to think at the shift is, how many bytes we need to
+     * move child pointers forward *other than* the obvious sizeof(void*)
+     * needed for the additional pointer itself. */
+    size_t shift = newlen - curlen - sizeof(void*);
+
+    /* We said we are adding a node with edge 'c'. The insertion
+     * point is between 'b' and 'd', so the 'pos' variable value is
+     * the index of the first child pointer that we need to move forward
+     * to make space for our new pointer.
+     *
+     * To start, move all the child pointers after the insertion point
+     * of shift+sizeof(pointer) bytes on the right, to obtain:
+     *
+     * [HDR*][abde][Aptr][Bptr][....][....][Dptr][Eptr]|AUXP|
+     */
+    src = n->data+n->size+
+          raxPadding(n->size)+
+          sizeof(raxNode*)*pos;
+    memmove(src+shift+sizeof(raxNode*),src,sizeof(raxNode*)*(n->size-pos));
+
+    /* Move the pointers to the left of the insertion position as well. Often
+     * we don't need to do anything if there was already some padding to use. In
+     * that case the final destination of the pointers will be the same, however
+     * in our example there was no pre-existing padding, so we added one byte
+     * plus three bytes of padding. After the next memmove() things will look
+     * like that:
+     *
+     * [HDR*][abde][....][Aptr][Bptr][....][Dptr][Eptr]|AUXP|
+     */
+    if (shift) {
+        src = (unsigned char*) raxNodeFirstChildPtr(n);
+        memmove(src+shift,src,sizeof(raxNode*)*pos);
+    }
 
     /* Now make the space for the additional char in the data section,
-     * but also move the pointers before the insertion point in the right
-     * by 1 byte, in order to obtain the following:
+     * but also move the pointers before the insertion point to the right
+     * by shift bytes, in order to obtain the following:
      *
-     * [numc][ab.x][ap][bp]....[xp]|auxp| */
+     * [HDR*][ab.d][e...][Aptr][Bptr][....][Dptr][Eptr]|AUXP|
+     */
     src = n->data+pos;
-    memmove(src+1,src,n->size-pos+sizeof(raxNode*)*pos);
+    memmove(src+1,src,n->size-pos);
 
     /* We can now set the character and its child node pointer to get:
      *
-     * [numc][abcx][ap][bp][cp]....|auxp|
-     * [numc][abcx][ap][bp][cp][xp]|auxp| */
+     * [HDR*][abcd][e...][Aptr][Bptr][....][Dptr][Eptr]|AUXP|
+     * [HDR*][abcd][e...][Aptr][Bptr][Cptr][Dptr][Eptr]|AUXP|
+     */
     n->data[pos] = c;
     n->size++;
-    raxNode **childfield = (raxNode**)(n->data+n->size+sizeof(raxNode*)*pos);
+    src = (unsigned char*) raxNodeFirstChildPtr(n);
+    raxNode **childfield = (raxNode**)(src+sizeof(raxNode*)*pos);
     memcpy(childfield,&child,sizeof(child));
     *childptr = child;
     *parentlink = childfield;
     return n;
 }
 
-/* Return the pointer to the last child pointer in a node. For the compressed
- * nodes this is the only child pointer. */
-#define raxNodeLastChildPtr(n) ((raxNode**) ( \
-    ((char*)(n)) + \
-    raxNodeCurrentLength(n) - \
-    sizeof(raxNode*) - \
-    (((n)->iskey && !(n)->isnull) ? sizeof(void*) : 0) \
-))
+/* ------------------------ FIXED-LENGTH helpers --------------------------- */
+/* Layout of nodes leaves is unchanged; only slot interpretation differs. Depth 
+ * is tracked implicitly: either by raxLowWalk or raxIterator.
+ *
+ * The child-pointer slots hold inlined values of the key instead of a pointer 
+ * to raxNode dedicated, so the layout is identical to a normal node, except each 
+ * child slot [Xptr] becomes the value [Xval] for the key ending in 'X', and there 
+ * is no trailing |AUXP| (a leaf parent is never itself a complete key):
+ *
+ *   iscompr=0:  [HDR*][abde][Aval][Bval][Dval][Eval]   (one slot per edge byte)
+ *   iscompr=1:  [HDR*][xyz][val]                       (single slot, leafSlot=0)
+ */
 
-/* Return the pointer to the first child pointer. */
-#define raxNodeFirstChildPtr(n) ((raxNode**)((n)->data+(n)->size))
+/* In a keyFixedLen>0 tree, the node at depth keyFixedLen-1 is a "leaf
+ * parent": descending one more step reaches depth keyFixedLen, so its child
+ * slots hold inlined value pointers, not raxNode pointers. Given the depth at
+ * which a node's children sit, report whether those slots are inlined values.*/
+static inline int raxSlotsAreValues(const rax *rax, size_t childDepth) {
+    return rax->keyFixedLen && childDepth == (size_t)rax->keyFixedLen;
+}
+
+/* Read the value pointer stored in slot `idx` of leaf parent `h`. */
+static inline void *raxLeafParentReadSlot(raxNode *parent, int idx) {
+    void *v;
+    memcpy(&v, raxNodeFirstChildPtr(parent) + idx, sizeof(v));
+    return v;
+}
+
+/* Write `value` into slot `idx` of leaf parent `h`. */
+static inline void raxLeafParentWriteSlot(raxNode *paremt, int idx, void *value) {
+    memcpy(raxNodeFirstChildPtr(paremt) + idx, &value, sizeof(value));
+}
+
+/* Add a new edge byte `ch` to leaf parent `n` (iscompr=0) and store the
+ * given value pointer in the new slot. Returns the (possibly realloc'd)
+ * parent node, or NULL on OOM. This is the leaf-parent counterpart of
+ * raxAddChild: no child raxNode is allocated.
+ *
+ * The byte/pointer shuffle is identical to raxAddChild; only the "what
+ * goes in the slot" step differs (we store `value` rather than a child
+ * pointer). Inserting edge 'c' (pos=2) between 'b' and 'd':
+ *
+ *   before:  [HDR*][abde][Aval][Bval][Dval][Eval]
+ *   after:   [HDR*][abcde][Aval][Bval][Cval][Dval][Eval]
+ */
+static raxNode *raxAddSlot(rax *rax, raxNode *n, unsigned char ch, void *value)
+{
+    unsigned char *src;
+    /* Unlike raxAddChild, there is no AUXP tail to relocate here: a leaf
+     * parent sits at depth keyFixedLen-1, so it is never itself a key. */
+    debugAssert(!n->iskey);
+    debugAssert(n->iscompr == 0);
+    debugAssert(rax->keyFixedLen > 0);
+
+    size_t curlen = raxNodeCurrentLength(n);
+    n->size++;
+    size_t newlen = raxNodeCurrentLength(n);
+    n->size--;
+    
+    /* realloc the node to make space if needed. */
+    if (rax_malloc_usable_size(n) < newlen) {
+        raxNode *newn = raxNodeRealloc(rax, n, newlen);
+        if (newn == NULL) return NULL;
+        n = newn;
+    }
+
+    /* Find the position of the new edge byte. */
+    int pos;
+    if (n->size > 0 && ch > n->data[n->size - 1]) {
+        pos = n->size;
+    } else {
+        for (pos = 0; pos < n->size; pos++) {
+            if (n->data[pos] > ch) break;
+        }
+
+        /* Slots at/after `pos` are the trailing (size-pos) pointers of the node.
+         * With no AUXP tail they end at n+curlen, so move that block to end at
+         * n+newlen, opening one slot's worth of gap (plus re-align padding). */
+        size_t tail = sizeof(void*) * (n->size - pos);
+        memmove((unsigned char*)n + newlen - tail,
+                (unsigned char*)n + curlen - tail, tail);
+    }
+
+    /* shift = padding word added when the new edge byte crosses an 8-byte
+     * boundary; if so, re-align the value slots before `pos` rightward. */
+    size_t shift = newlen - curlen - sizeof(void*);
+    if (shift) {
+        src = (unsigned char*) raxNodeFirstChildPtr(n);
+        memmove(src + shift, src, sizeof(void*) * pos);
+    }
+
+    /* Open the gap in the edge-byte array for the new edge byte. */
+    if (pos < n->size) {
+        src = n->data + pos;
+        memmove(src + 1, src, n->size - pos);
+    }
+
+    n->data[pos] = ch;
+    n->size++;
+    src = (unsigned char*) raxNodeFirstChildPtr(n);
+    void **slot = (void**)(src + sizeof(void*) * pos);
+    memcpy(slot, &value, sizeof(value));
+    return n;
+}
+
+/* Remove the slot at index `idx` from leaf parent `parent` (iscompr=0).
+ * Returns the (possibly realloc'd) parent node. The caller is responsible
+ * for freeing the value previously stored at the slot (the slot is just
+ * void*-sized, the rax never owns the value).
+ *
+ * This mirrors raxRemoveChild's non-compressed branch; the slots hold
+ * values (void*), not raxNode* pointers, and there is no AUXP tail to
+ * preserve since a leaf parent is never itself a key. */
+static raxNode *raxRemoveSlotAt(rax *rax, raxNode *parent, int idx) {
+    debugAssert(!parent->iscompr);
+    debugAssert(!parent->iskey);
+    debugAssert(idx >= 0 && idx < parent->size);
+    debugnode("raxRemoveSlotAt before", parent);
+
+    void **pFirst = (void**) raxNodeFirstChildPtr(parent);
+    void **pIdx = pFirst + idx;
+    
+    /* Move the edge bytes before the deletion point. */
+    unsigned char *e = parent->data + idx;
+    int taillen = parent->size - idx - 1;
+    memmove(e, e + 1, taillen);
+    
+    /* shift = padding word added when the new edge byte crosses an 8-byte
+     * boundary; if so, re-align the value slots before `pos` rightward. */
+    size_t shift = ((parent->size + 4) % sizeof(void*)) == 1 ? sizeof(void*) : 0;
+    if (shift)
+        memmove(((char*)pFirst) - shift, pFirst, idx * sizeof(void*));
+
+    /* Move the remaining value slots at the right position as well. */
+    memmove(((char*)pIdx) - shift, pIdx + 1, taillen * sizeof(void*));
+
+    parent->size--;
+    raxNode *newn = raxNodeRealloc(rax, parent, raxNodeCurrentLength(parent));
+    debugnode("raxRemoveSlotAt after", newn ? newn : parent);
+    return newn ? newn : parent;
+}
+
+/* On insertion with keyFixedLen>0, if the insert loop ended with a new node 
+ * (size==0), then append the suffix bytes of the key as compressed to the node 
+ * and store the value pointer in the single slot (no leaf raxNode). 
+ *
+ *   before:  [HDR iscompr=0 size=0]               (new empty, no children)
+ *   after:   [HDR iscompr=1 size=1][xyz][V]   (V inlined in the single slot)
+ */
+static raxNode *raxCompressNodeWithValue(rax *rax, raxNode *n,
+                                         unsigned char *s, size_t len, void *value)
+{
+    debugAssert(n->size == 0);
+    /* Only reached in keyFixedLen mode, fusing a fresh intermediate node at
+     * depth < keyFixedLen: it is never a key, so there is no value-ptr tail */
+    debugAssert(rax->keyFixedLen > 0);
+    debugAssert(!n->iskey);
+
+    /* Layout: [hdr][s[0..len-1]][padding][value_slot] (value in slot, no AUXP) */
+    size_t newsize = sizeof(raxNode) + len + raxPadding(len) + sizeof(void*);
+    raxNode *newn = raxNodeRealloc(rax, n, newsize);
+    if (newn == NULL) return NULL;
+    n = newn;
+
+    n->iscompr = 1;
+    n->size = len;
+    memcpy(n->data, s, len);
+    void **slot = (void**) raxNodeLastChildPtr(n);
+    memcpy(slot, &value, sizeof(value));
+    return n;
+}
 
 /* Turn the node 'n', that must be a node without any children, into a
  * compressed node representing a set of nodes linked one after the other
@@ -309,7 +588,7 @@ raxNode *raxAddChild(raxNode *n, unsigned char c, raxNode **childptr, raxNode **
  * The function also returns a child node, since the last node of the
  * compressed chain cannot be part of the chain: it has zero children while
  * we can only compress inner nodes with exactly one child each. */
-raxNode *raxCompressNode(raxNode *n, unsigned char *s, size_t len, raxNode **child) {
+raxNode *raxCompressNode(rax *rax, raxNode *n, unsigned char *s, size_t len, raxNode **child) {
     assert(n->size == 0 && n->iscompr == 0);
     void *data = NULL; /* Initialized only to avoid warnings. */
     size_t newsize;
@@ -317,18 +596,18 @@ raxNode *raxCompressNode(raxNode *n, unsigned char *s, size_t len, raxNode **chi
     debugf("Compress node: %.*s\n", (int)len,s);
 
     /* Allocate the child to link to this node. */
-    *child = raxNewNode(0,0);
+    *child = raxNewNode(rax,0,0);
     if (*child == NULL) return NULL;
 
     /* Make space in the parent node. */
-    newsize = sizeof(raxNode)+len+sizeof(raxNode*);
+    newsize = sizeof(raxNode)+len+raxPadding(len)+sizeof(raxNode*);
     if (n->iskey) {
         data = raxGetData(n); /* To restore it later. */
         if (!n->isnull) newsize += sizeof(void*);
     }
-    raxNode *newn = rax_realloc(n,newsize);
+    raxNode *newn = raxNodeRealloc(rax,n,newsize);
     if (newn == NULL) {
-        rax_free(*child);
+        raxFreeNode(rax, *child);
         return NULL;
     }
     n = newn;
@@ -342,30 +621,28 @@ raxNode *raxCompressNode(raxNode *n, unsigned char *s, size_t len, raxNode **chi
     return n;
 }
 
-/* Low level function that walks the tree looking for the string
- * 's' of 'len' bytes. The function returns the number of characters
- * of the key that was possible to process: if the returned integer
- * is the same as 'len', then it means that the node corresponding to the
- * string was found (however it may not be a key in case the node->iskey is
- * zero or if simply we stopped in the middle of a compressed node, so that
- * 'splitpos' is non zero).
+/* Walk the tree following the key bytes `s[0..len-1]` and populate
+ * `link` with the stop state (see raxNodeLink). If `ts` is non-NULL,
+ * parent nodes are pushed there for upward cleanup by raxRemove.
  *
- * Otherwise if the returned integer is not the same as 'len', there was an
- * early stop during the tree walk because of a character mismatch.
- *
- * The node where the search ended (because the full string was processed
- * or because there was an early stop) is returned by reference as
- * '*stopnode' if the passed pointer is not NULL. This node link in the
- * parent's node is returned as '*plink' if not NULL. Finally, if the
- * search stopped in a compressed node, '*splitpos' returns the index
- * inside the compressed node where the search ended. This is useful to
- * know where to split the node for insertion. */
-static inline size_t raxLowWalk(rax *rax, unsigned char *s, size_t len, raxNode **stopnode, raxNode ***plink, int *splitpos, raxStack *ts) {
+ * Returns 1 if `s[0..len-1]` is an exact key in the rax, 0 otherwise.
+ * On match, if `value` is non-NULL, *value is set to the stored value
+ * (which may itself be NULL when the key was inserted with isnull).
+ * On miss, *value is left untouched. `link->i` always carries the
+ * number of matched bytes regardless of match/miss. */
+static inline int raxLowWalk(rax *rax, unsigned char *s, size_t len,
+                             void **value, raxNodeLink *link, raxStack *ts) {
     raxNode *h = rax->head;
     raxNode **parentlink = &rax->head;
 
     size_t i = 0; /* Position in the string. */
     size_t j = 0; /* Position in the node children (or bytes if compressed).*/
+
+    /* Stop-state defaults, overwritten by the walk as it progresses:
+     * splitpos=0 (clean stop at a node boundary) and leafSlot=-1 (the
+     * stop is not a fixed-length leaf parent). */
+    link->splitpos = 0;
+    link->leafSlot = -1;
     while(h->size && i < len) {
         debugnode("Lookup current node",h);
         unsigned char *v = h->data;
@@ -376,14 +653,45 @@ static inline size_t raxLowWalk(rax *rax, unsigned char *s, size_t len, raxNode 
             }
             if (j != h->size) break;
         } else {
-            /* Even when h->size is large, linear scan provides good
-             * performances compared to other approaches that are in theory
-             * more sounding, like performing a binary search. */
-            for (j = 0; j < h->size; j++) {
-                if (v[j] == s[i]) break;
+            /* Children are sorted. Check the last child first: for
+             * sequential inserts the match is almost always at the end,
+             * and for random keys the extra compare is negligible vs
+             * the O(n) scan that follows on miss. */
+            if (v[h->size - 1] == s[i]) {
+                j = h->size - 1;
+            } else if (s[i] > v[h->size - 1]) {
+                j = h->size;
+                break;
+            } else {
+                /* Lookup the matching child edge. memchr() is used instead
+                 * of an open-coded scalar loop because libc implementations
+                 * on most platforms are SIMD-optimized (SSE2/AVX2 on x86,
+                 * NEON on arm64), which is significantly faster than a
+                 * byte-by-byte scan at the small fan-out sizes (<= 256)
+                 * that rax nodes can have. */
+                unsigned char *p = memchr(v, s[i], h->size);
+                if (p == NULL) break;
+                j = (size_t)(p - v);
             }
-            if (j == h->size) break;
             i++;
+        }
+
+        /* Fixed-length leaf-parent stop. We've matched at `h`. Descending now
+         * would land us at depth keyFixedLen (the leaf depth), but the value
+         * lives inline in the slot at children+j, not in a child raxNode. So
+         * stop here, record the slot, and return a match -- this bypasses the
+         * normal post-loop key-node checks, which don't apply. Reached only on
+         * a successful byte match (iscompr=0) or full-prefix match (iscompr=1),
+         * so the slot is always present. */
+        if (raxSlotsAreValues(rax, i)) {
+            debugnode("Lookup leaf-parent stop node is", h);
+            link->stopnode = h;
+            link->parentlink = parentlink;
+            link->consumed = i;
+            link->splitpos = RAX_LEAF_PARENT_STOP;
+            link->leafSlot = h->iscompr ? 0 : (int)j;
+            if (value != NULL) *value = raxLeafParentReadSlot(h, link->leafSlot);
+            return 1;
         }
 
         if (ts) raxStackPush(ts,h); /* Save stack of parent nodes. */
@@ -391,33 +699,91 @@ static inline size_t raxLowWalk(rax *rax, unsigned char *s, size_t len, raxNode 
         if (h->iscompr) j = 0; /* Compressed node only child is at index 0. */
         memcpy(&h,children+j,sizeof(h));
         parentlink = children+j;
-        j = 0; /* If the new node is compressed and we do not
-                  iterate again (since i == l) set the split
+        j = 0; /* If the new node is non compressed and we do not
+                  iterate again (since i == len) set the split
                   position to 0 to signal this node represents
                   the searched key. */
     }
     debugnode("Lookup stop node is",h);
-    if (stopnode) *stopnode = h;
-    if (plink) *plink = parentlink;
-    if (splitpos && h->iscompr) *splitpos = j;
-    return i;
+    link->stopnode = h;
+    link->parentlink = parentlink;
+    link->consumed = i;
+    /* if Non-leaf-parent-compressed stop: record the split position in the
+     * compressed prefix. otherwise splitpos stays at the default 0 set on entry. */
+    if (h->iscompr) link->splitpos = j;
+
+    /* Match: query fully consumed, clean stop at a node boundary (not
+     * mid-prefix on a compressed node), and h is a key. */
+    if (i != len || (h->iscompr && link->splitpos != 0) || !h->iskey)
+        return 0;
+    
+    if (value != NULL) *value = raxGetData(h);
+    return 1;
 }
 
-/* Insert the element 's' of size 'len', setting as auxiliary data
- * the pointer 'data'. If the element is already present, the associated
- * data is updated, and 0 is returned, otherwise the element is inserted
- * and 1 is returned. On out of memory the function returns 0 as well but
- * sets errno to ENOMEM, otherwise errno will be set to 0. */
-int raxInsert(rax *rax, unsigned char *s, size_t len, void *data, void **old) {
-    size_t i;
-    int j = 0; /* Split position. If raxLowWalk() stops in a compressed
-                  node, the index 'j' represents the char we stopped within the
-                  compressed node, that is, the position where to split the
-                  node for insertion. */
-    raxNode *h, **parentlink;
+#ifdef DEBUG_ASSERTIONS
+/* Re-walk the tree and verify `link` still matches the current state,
+ * i.e. no rax mutation happened between raxFindLink() and the current
+ * raxInsertAt(). Returns 1 if the link is still valid, 0 otherwise.
+ * Used only from a debugAssert(). */
+static int raxLinkStillValid(rax *rax, unsigned char *s, size_t len, raxNodeLink *link) {
+    raxNodeLink cur;
+    raxLowWalk(rax, s, len, NULL, &cur, NULL);
+    return cur.stopnode   == link->stopnode &&
+           cur.parentlink == link->parentlink &&
+           cur.consumed   == link->consumed &&
+           cur.splitpos   == link->splitpos &&
+           cur.leafSlot   == link->leafSlot;
+}
+#endif
 
+/* Commit an insert at the position recorded in `link`. The link must
+ * have come from an immediately-preceding raxFindLink() on (rax, s, len)
+ * with no intervening rax mutation.
+ *
+ * If the link lands on an existing key, the associated data is
+ * overwritten with `data`, the prior value is stored at *old (when old
+ * is non-NULL), and 0 is returned. Otherwise the element is inserted
+ * and 1 is returned. Callers wanting try-insert semantics (preserve
+ * existing) should check raxFindLink's return first and skip this call
+ * when it reports 1.
+ *
+ * On out of memory the function returns 0 and sets errno to ENOMEM;
+ * otherwise errno is set to 0. */
+int raxInsertAt(rax *rax, unsigned char *s, size_t len, void *data, void **old, raxNodeLink *link) {
+    /* If rax has fixed-length keys, the input must match the length. */
+    assert(!rax->keyFixedLen || len == rax->keyFixedLen);
+    /* The link must reflect the current tree: no rax mutation is allowed
+     * between the raxFindLink() that produced it and this commit. */
+    debugAssert(raxLinkStillValid(rax, s, len, link));
+    
+    size_t usable;
+    /* Pull walk state from `link`. */
+    size_t i = link->consumed;
+    int j = link->splitpos; /* Split position. If raxLowWalk() stopped in
+                               a compressed node, 'j' is the char index
+                               within the compressed node where we
+                               stopped; i.e. the position where to split
+                               the node for insertion. Only meaningful
+                               when h->iscompr. */
+    raxNode *h = link->stopnode, **parentlink = link->parentlink;
+    size_t dummy, *alloc_size = &dummy;
+
+    if (rax->alloc_size) alloc_size = rax->alloc_size;
     debugf("### Insert %.*s with value %p\n", (int)len, s, data);
-    i = raxLowWalk(rax,s,len,&h,&parentlink,&j,NULL);
+
+    /* Fixed-length leaf-parent commit: raxLowWalk halted at h because
+     * descending would land at a leaf slot. The walk only stops here
+     * on a successful byte match, so the slot at link->leafSlot always
+     * holds the existing value; overwrite it. New-key inlining is
+     * handled below via the main insert loop (raxAddSlot / fused
+     * raxCompressNodeWithValue). */
+    if (link->splitpos == RAX_LEAF_PARENT_STOP) {
+        if (old) *old = raxLeafParentReadSlot(h, link->leafSlot);
+        raxLeafParentWriteSlot(h, link->leafSlot, data);
+        errno = 0;
+        return 0; /* Existing key, overwritten. */
+    }
 
     /* If i == len we walked following the whole string. If we are not
      * in the middle of a compressed node, the string is either already
@@ -426,20 +792,26 @@ int raxInsert(rax *rax, unsigned char *s, size_t len, void *data, void **old) {
      * data pointer. */
     if (i == len && (!h->iscompr || j == 0 /* not in the middle if j is 0 */)) {
         debugf("### Insert: node representing key exists\n");
+        /* Make space for the value pointer if needed. */
         if (!h->iskey || h->isnull) {
-            h = raxReallocForData(h,data);
+            h = raxReallocForData(rax,h,data);
             if (h) memcpy(parentlink,&h,sizeof(h));
         }
         if (h == NULL) {
             errno = ENOMEM;
             return 0;
         }
+
+        /* Update the existing key if there is already one. */
         if (h->iskey) {
             if (old) *old = raxGetData(h);
             raxSetData(h,data);
             errno = 0;
-            return 0; /* Element already exists. */
+            return 0; /* Element already exists, overwritten. */
         }
+
+        /* Otherwise set the node as a key. Note that raxSetData()
+         * will set h->iskey. */
         raxSetData(h,data);
         rax->numele++;
         return 1; /* Element inserted. */
@@ -448,9 +820,9 @@ int raxInsert(rax *rax, unsigned char *s, size_t len, void *data, void **old) {
     /* If the node we stopped at is a compressed node, we need to
      * split it before to continue.
      *
-     * Splitting a compressed node have a few possibile cases.
+     * Splitting a compressed node have a few possible cases.
      * Imagine that the node 'h' we are currently at is a compressed
-     * node contaning the string "ANNIBALE" (it means that it represents
+     * node containing the string "ANNIBALE" (it means that it represents
      * nodes A -> N -> N -> I -> B -> A -> L -> E with the only child
      * pointer of this node pointing at the 'E' node, because remember that
      * we have characters at the edges of the graph, not inside the nodes
@@ -524,7 +896,7 @@ int raxInsert(rax *rax, unsigned char *s, size_t len, void *data, void **old) {
      *
      * 3b. IF $SPLITPOS != 0:
      *     Trim the compressed node (reallocating it as well) in order to
-     *     contain $splitpos characters. Change chilid pointer in order to link
+     *     contain $splitpos characters. Change child pointer in order to link
      *     to the split node. If new compressed node len is just 1, set
      *     iscompr to 0 (layout is the same). Fix parent's reference.
      *
@@ -549,7 +921,7 @@ int raxInsert(rax *rax, unsigned char *s, size_t len, void *data, void **old) {
      * Let $SPLITPOS be the zero-based index at which, in the
      * compressed node array of characters, we stopped iterating because
      * there were no more keys character to match. So in the example of
-     * the node "ANNIBALE", addig the string "ANNI", the $SPLITPOS is 4.
+     * the node "ANNIBALE", adding the string "ANNI", the $SPLITPOS is 4.
      *
      * 1. Save the current compressed node $NEXT pointer (the pointer to the
      *    child element, that is always present in compressed nodes).
@@ -562,7 +934,7 @@ int raxInsert(rax *rax, unsigned char *s, size_t len, void *data, void **old) {
      *
      * 3. Trim the current node to contain the first $SPLITPOS characters.
      *    As usually if the new node length is just 1, set iscompr to 0.
-     *    Take the iskey / associated value as it was in the orignal node.
+     *    Take the iskey / associated value as it was in the original node.
      *    Fix the parent's reference.
      *
      * 4. Set the postfix node as the only child pointer of the trimmed
@@ -595,20 +967,23 @@ int raxInsert(rax *rax, unsigned char *s, size_t len, void *data, void **old) {
 
         /* 2: Create the split node. Also allocate the other nodes we'll need
          *    ASAP, so that it will be simpler to handle OOM. */
-        raxNode *splitnode = raxNewNode(1, split_node_is_key);
+        raxNode *splitnode = raxNewNode(rax, 1, split_node_is_key);
         raxNode *trimmed = NULL;
         raxNode *postfix = NULL;
 
         if (trimmedlen) {
-            nodesize = sizeof(raxNode)+trimmedlen+sizeof(raxNode*);
+            nodesize = sizeof(raxNode)+trimmedlen+raxPadding(trimmedlen)+
+                       sizeof(raxNode*);
             if (h->iskey && !h->isnull) nodesize += sizeof(void*);
-            trimmed = rax_malloc(nodesize);
+            trimmed = rax_malloc_usable(nodesize, &usable);
+            *alloc_size += usable;
         }
 
         if (postfixlen) {
-            nodesize = sizeof(raxNode)+postfixlen+
+            nodesize = sizeof(raxNode)+postfixlen+raxPadding(postfixlen)+
                        sizeof(raxNode*);
-            postfix = rax_malloc(nodesize);
+            postfix = rax_malloc_usable(nodesize, &usable);
+            *alloc_size += usable;
         }
 
         /* OOM? Abort now that the tree is untouched. */
@@ -616,9 +991,9 @@ int raxInsert(rax *rax, unsigned char *s, size_t len, void *data, void **old) {
             (trimmedlen && trimmed == NULL) ||
             (postfixlen && postfix == NULL))
         {
-            rax_free(splitnode);
-            rax_free(trimmed);
-            rax_free(postfix);
+            raxFreeNode(rax,splitnode);
+            raxFreeNode(rax,trimmed);
+            raxFreeNode(rax,postfix);
             errno = ENOMEM;
             return 0;
         }
@@ -673,7 +1048,7 @@ int raxInsert(rax *rax, unsigned char *s, size_t len, void *data, void **old) {
         /* 6. Continue insertion: this will cause the splitnode to
          * get a new child (the non common character at the currently
          * inserted key). */
-        rax_free(h);
+        raxFreeNode(rax,h);
         h = splitnode;
     } else if (h->iscompr && i == len) {
     /* ------------------------- ALGORITHM 2 --------------------------- */
@@ -682,20 +1057,24 @@ int raxInsert(rax *rax, unsigned char *s, size_t len, void *data, void **old) {
 
         /* Allocate postfix & trimmed nodes ASAP to fail for OOM gracefully. */
         size_t postfixlen = h->size - j;
-        size_t nodesize = sizeof(raxNode)+postfixlen+sizeof(raxNode*);
+        size_t nodesize = sizeof(raxNode)+postfixlen+raxPadding(postfixlen)+
+                          sizeof(raxNode*);
         if (data != NULL) nodesize += sizeof(void*);
-        raxNode *postfix = rax_malloc(nodesize);
+        raxNode *postfix = rax_malloc_usable(nodesize, &usable);
+        *alloc_size += usable;
 
-        nodesize = sizeof(raxNode)+j+sizeof(raxNode*);
+        nodesize = sizeof(raxNode)+j+raxPadding(j)+sizeof(raxNode*);
         if (h->iskey && !h->isnull) nodesize += sizeof(void*);
-        raxNode *trimmed = rax_malloc(nodesize);
+        raxNode *trimmed = rax_malloc_usable(nodesize, &usable);
+        *alloc_size += usable;
 
         if (postfix == NULL || trimmed == NULL) {
-            rax_free(postfix);
-            rax_free(trimmed);
+            raxFreeNode(rax,postfix);
+            raxFreeNode(rax,trimmed);
             errno = ENOMEM;
             return 0;
         }
+
 
         /* 1: Save next pointer. */
         raxNode **childfield = raxNodeLastChildPtr(h);
@@ -730,15 +1109,18 @@ int raxInsert(rax *rax, unsigned char *s, size_t len, void *data, void **old) {
         cp = raxNodeLastChildPtr(trimmed);
         memcpy(cp,&postfix,sizeof(postfix));
 
-        /* Finish! We don't need to contine with the insertion
+        /* Finish! We don't need to continue with the insertion
          * algorithm for ALGO 2. The key is already inserted. */
         rax->numele++;
-        rax_free(h);
+        raxFreeNode(rax,h);
         return 1; /* Key inserted. */
     }
 
     /* We walked the radix tree as far as we could, but still there are left
-     * chars in our string. We need to insert the missing nodes. */
+     * chars in our string. We need to insert the missing nodes.
+     *
+     * On Fixed-length leaf-inlining, if the next step would reach depth
+     * keyFixedLen, store the value in the parent's child slot instead */
     while(i < len) {
         raxNode *child;
 
@@ -750,16 +1132,36 @@ int raxInsert(rax *rax, unsigned char *s, size_t len, void *data, void **old) {
             size_t comprsize = len-i;
             if (comprsize > RAX_NODE_MAX_SIZE)
                 comprsize = RAX_NODE_MAX_SIZE;
-            raxNode *newh = raxCompressNode(h,s+i,comprsize,&child);
+            if (rax->keyFixedLen) {
+                /* Fixed-length: this compressed prefix carries the whole remaining
+                 * suffix (comprsize == len-i),  reaches the leaf depth. Fuse it with
+                 * the value (no leaf raxNode). */                
+                debugAssert(raxSlotsAreValues(rax, i + comprsize));
+                raxNode *newh = raxCompressNodeWithValue(rax, h, s+i, comprsize, data);
+                if (newh == NULL) goto oom;
+                memcpy(parentlink, &newh, sizeof(h));
+                rax->numele++;
+                return 1;
+            }
+            raxNode *newh = raxCompressNode(rax,h,s+i,comprsize,&child);
             if (newh == NULL) goto oom;
             h = newh;
             memcpy(parentlink,&h,sizeof(h));
             parentlink = raxNodeLastChildPtr(h);
             i += comprsize;
         } else {
+            /* Fixed-length: if this edge-byte step reaches the leaf depth,
+             * stamp the edge byte and inline the value (no leaf raxNode). */
+            if (raxSlotsAreValues(rax, i + 1)) {
+                raxNode *newh = raxAddSlot(rax, h, s[i], data);
+                if (newh == NULL) goto oom;
+                memcpy(parentlink, &newh, sizeof(h));
+                rax->numele++;
+                return 1;
+            }
             debugf("Inserting normal node\n");
             raxNode **new_parentlink;
-            raxNode *newh = raxAddChild(h,s[i],&child,&new_parentlink);
+            raxNode *newh = raxAddChild(rax,h,s[i],&child,&new_parentlink);
             if (newh == NULL) goto oom;
             h = newh;
             memcpy(parentlink,&h,sizeof(h));
@@ -769,7 +1171,7 @@ int raxInsert(rax *rax, unsigned char *s, size_t len, void *data, void **old) {
         rax->numnodes++;
         h = child;
     }
-    raxNode *newh = raxReallocForData(h,data);
+    raxNode *newh = raxReallocForData(rax,h,data);
     if (newh == NULL) goto oom;
     h = newh;
     if (!h->iskey) rax->numele++;
@@ -793,18 +1195,53 @@ oom:
     return 0;
 }
 
-/* Find a key in the rax, returns raxNotFound special void pointer value
- * if the item was not found, otherwise the value associated with the
- * item is returned. */
-void *raxFind(rax *rax, unsigned char *s, size_t len) {
-    raxNode *h;
+/* Walk the rax once and record the stop position in `link`. Returns 1 if
+ * `s` is an existing key (and, if `value` is non-NULL, stores the value
+ * at *value); 0 otherwise. The link is populated either way so a caller
+ * that meant "find or insert" can commit via raxInsertAt() without a
+ * second walk.
+ *
+ * Invalidation contract: `link->h` and `link->parentlink` are interior
+ * pointers into the tree. They become stale on ANY intervening rax
+ * mutation. Callers MUST commit (or discard) immediately after the
+ * find; do not interleave other rax calls on the same tree, do not
+ * retain across yield points. */
+int raxFindLink(rax *rax, unsigned char *s, size_t len,
+                void **value, raxNodeLink *link) {
+    debugf("### FindLink: %.*s\n", (int)len, s);
+    return raxLowWalk(rax, s, len, value, link, NULL);
+}
 
-    debugf("### Lookup: %.*s\n", (int)len, s);
-    int splitpos = 0;
-    size_t i = raxLowWalk(rax,s,len,&h,NULL,&splitpos,NULL);
-    if (i != len || (h->iscompr && splitpos != 0) || !h->iskey)
-        return raxNotFound;
-    return raxGetData(h);
+/* Overwriting insert. One walk via raxFindLink, then commit at the
+ * recorded position. Existing element is updated. */
+int raxInsert(rax *rax, unsigned char *s, size_t len, void *data, void **old) {
+    raxNodeLink link;
+    raxFindLink(rax, s, len, NULL, &link);
+    return raxInsertAt(rax,s,len,data,old,&link);
+}
+
+/* Non-overwriting insert. If an element with the same key exists, the
+ * value is not updated and 0 is returned (with *old set, if non-NULL,
+ * to the existing value). raxFindLink already tells us whether the key
+ * exists, so we skip raxInsertAt's overwrite path entirely in that
+ * case. */
+int raxTryInsert(rax *rax, unsigned char *s, size_t len, void *data, void **old) {
+    raxNodeLink link;
+    void *existing;
+    if (raxFindLink(rax, s, len, &existing, &link)) {
+        if (old) *old = existing;
+        errno = 0;
+        return 0;
+    }
+    return raxInsertAt(rax,s,len,data,old,&link);
+}
+
+/* Find a key in the rax: return 1 if the item is found, 0 otherwise.
+ * If there is an item and 'value' is passed in a non-NULL pointer, the
+ * value associated with the item is set at that address. */
+int raxFind(rax *rax, unsigned char *s, size_t len, void **value) {
+    raxNodeLink link;
+    return raxFindLink(rax, s, len, value, &link);
 }
 
 /* Return the memory address where the 'parent' node stores the specified
@@ -827,7 +1264,7 @@ raxNode **raxFindParentLink(raxNode *parent, raxNode *child) {
  * removal) is returned. Note that this function does not fix the pointer
  * of the parent node in its parent, so this task is up to the caller.
  * The function never fails for out of memory. */
-raxNode *raxRemoveChild(raxNode *parent, raxNode *child) {
+raxNode *raxRemoveChild(rax *rax, raxNode *parent, raxNode *child) {
     debugnode("raxRemoveChild before", parent);
     /* If parent is a compressed node (having a single child, as for definition
      * of the data structure), the removal of the child consists into turning
@@ -843,7 +1280,7 @@ raxNode *raxRemoveChild(raxNode *parent, raxNode *child) {
         return parent;
     }
 
-    /* Otherwise we need to scan for the children pointer and memmove()
+    /* Otherwise we need to scan for the child pointer and memmove()
      * accordingly.
      *
      * 1. To start we seek the first element in both the children
@@ -868,23 +1305,32 @@ raxNode *raxRemoveChild(raxNode *parent, raxNode *child) {
     debugf("raxRemoveChild tail len: %d\n", taillen);
     memmove(e,e+1,taillen);
 
-    /* Since we have one data byte less, also child pointers start one byte
-     * before now. */
-    memmove(((char*)cp)-1,cp,(parent->size-taillen-1)*sizeof(raxNode**));
+    /* Compute the shift, that is the amount of bytes we should move our
+     * child pointers to the left, since the removal of one edge character
+     * and the corresponding padding change, may change the layout.
+     * We just check if in the old version of the node there was at the
+     * end just a single byte and all padding: in that case removing one char
+     * will remove a whole sizeof(void*) word. */
+    size_t shift = ((parent->size+4) % sizeof(void*)) == 1 ? sizeof(void*) : 0;
 
-    /* Move the remaining "tail" pointer at the right position as well. */
-    memmove(((char*)c)-1,c+1,taillen*sizeof(raxNode**)+parent->iskey*sizeof(void*));
+    /* Move the children pointers before the deletion point. */
+    if (shift)
+        memmove(((char*)cp)-shift,cp,(parent->size-taillen-1)*sizeof(raxNode**));
+
+    /* Move the remaining "tail" pointers at the right position as well. */
+    size_t valuelen = (parent->iskey && !parent->isnull) ? sizeof(void*) : 0;
+    memmove(((char*)c)-shift,c+1,taillen*sizeof(raxNode**)+valuelen);
 
     /* 4. Update size. */
     parent->size--;
 
     /* realloc the node according to the theoretical memory usage, to free
      * data if we are over-allocating right now. */
-    raxNode *newnode = rax_realloc(parent,raxNodeCurrentLength(parent));
+    raxNode *newnode = raxNodeRealloc(rax,parent,raxNodeCurrentLength(parent));
     if (newnode) {
         debugnode("raxRemoveChild after", newnode);
     }
-    /* Note: if rax_realloc() fails we just return the old address, which
+    /* Note: if raxNodeRealloc() fails we just return the old address, which
      * is valid. */
     return newnode ? newnode : parent;
 }
@@ -892,20 +1338,49 @@ raxNode *raxRemoveChild(raxNode *parent, raxNode *child) {
 /* Remove the specified item. Returns 1 if the item was found and
  * deleted, 0 otherwise. */
 int raxRemove(rax *rax, unsigned char *s, size_t len, void **old) {
-    raxNode *h;
+    debugAssert(!rax->keyFixedLen || len == rax->keyFixedLen);
+    raxNodeLink link;
     raxStack ts;
 
     debugf("### Delete: %.*s\n", (int)len, s);
     raxStackInit(&ts);
-    int splitpos = 0;
-    size_t i = raxLowWalk(rax,s,len,&h,NULL,&splitpos,&ts);
-    if (i != len || (h->iscompr && splitpos != 0) || !h->iskey) {
+    if (!raxLowWalk(rax, s, len, old, &link, &ts)) {
         raxStackFree(&ts);
         return 0;
     }
-    if (old) *old = raxGetData(h);
-    h->iskey = 0;
+    raxNode *h = link.stopnode;
     rax->numele--;
+
+    /* Fixed-length leaf-parent slot removal. We stopped at h before entering the
+     * leaf slot. link.leafSlot is the inlined value-slot index: 0 when
+     * iscompr=1, otherwise the matched edge index. Drop it, then unlink h if it
+     * becomes useless and continue the normal upward cleanup. */
+    if (link.splitpos == RAX_LEAF_PARENT_STOP) {
+        int slot_idx = link.leafSlot;
+
+        /* Case A: iscompr=0 leaf parent with > 1 slots. Shrink h and done. */
+        if (!h->iscompr && h->size > 1) {
+            raxNode *newh = raxRemoveSlotAt(rax, h, slot_idx);
+            if (newh != h) {
+                raxNode *parent = raxStackPeek(&ts);
+                raxNode **parentlink = parent == NULL
+                    ? &rax->head : raxFindParentLink(parent, h);
+                memcpy(parentlink, &newh, sizeof(newh));
+            }
+            raxStackFree(&ts);
+            return 1;
+        }
+
+        /* Case B: removing this slot empties the leaf parent: always for iscompr=1,
+         * or for iscompr=0 when size==1. Free it, then walk upward freeing
+         * single-child non-key ancestors, as in the leaf-raxNode cleanup path below. */
+        h->isnull = 0;
+        h->iscompr = 0;
+        h->size = 0;
+    }  /* fall-through to standard cleanup */
+    
+    /* Normal leaf raxNode removal. */
+    h->iskey = 0;
 
     /* If this node has no children, the deletion needs to reclaim the
      * no longer used nodes. This is an iterative process that needs to
@@ -923,17 +1398,17 @@ int raxRemove(rax *rax, unsigned char *s, size_t len, void **old) {
             child = h;
             debugf("Freeing child %p [%.*s] key:%d\n", (void*)child,
                 (int)child->size, (char*)child->data, child->iskey);
-            rax_free(child);
+            raxFreeNode(rax,child);
             rax->numnodes--;
             h = raxStackPop(&ts);
-             /* If this node has more then one child, or actually holds
+             /* If this node has more than one child, or actually holds
               * a key, stop here. */
             if (h->iskey || (!h->iscompr && h->size != 1)) break;
         }
         if (child) {
             debugf("Unlinking child %p from parent %p\n",
                 (void*)child, (void*)h);
-            raxNode *new = raxRemoveChild(h,child);
+            raxNode *new = raxRemoveChild(rax,h,child);
             if (new != h) {
                 raxNode *parent = raxStackPeek(&ts);
                 raxNode **parentlink;
@@ -954,7 +1429,7 @@ int raxRemove(rax *rax, unsigned char *s, size_t len, void **old) {
         }
     } else if (h->size == 1) {
         /* If the node had just one child, after the removal of the key
-         * further compression with adjacent nodes is pontentially possible. */
+         * further compression with adjacent nodes is potentially possible. */
         trycompress = 1;
     }
 
@@ -974,9 +1449,9 @@ int raxRemove(rax *rax, unsigned char *s, size_t len, void **old) {
      * We try to navigate upward till there are other nodes that can be
      * compressed, when we reach the upper node which is not a key and has
      * a single child, we scan the chain of children to collect the
-     * compressable part of the tree, and replace the current node with the
+     * compressible part of the tree, and replace the current node with the
      * new one, fixing the child pointer to reference the first non
-     * compressable node.
+     * compressible node.
      *
      * Example of case "1". A tree stores the keys "FOO" = 1 and
      * "FOOBAR" = 2:
@@ -1023,13 +1498,28 @@ int raxRemove(rax *rax, unsigned char *s, size_t len, void **old) {
         }
         raxNode *start = h; /* Compression starting node. */
 
+        /* Fixed-length: compute start's depth, based on stack, so the scans below 
+         * can stop at a leaf parent. its depth is the sum of their edge lengths */
+        int dstart = 0; /* depth of the compression start node */
+        if (rax->keyFixedLen) {
+            for (size_t k = 0; k < ts.items; k++)
+                dstart += raxStepLenNode(ts.stack[k]);
+            /* If parent exists, add its edge len too (Not part of the stack) */
+            if (parent) dstart += raxStepLenNode(parent);
+        }
+
         /* Scan chain of nodes we can compress. */
         size_t comprsize = h->size;
         int nodes = 1;
+        int dh = dstart;            /* depth of the current node `h` */
         while(h->size != 0) {
             raxNode **cp = raxNodeLastChildPtr(h);
+            dh += raxStepLenNode(h);   /* depth of the child */
             memcpy(&h,cp,sizeof(h));
-            if (h->iskey || (!h->iscompr && h->size != 1)) break;
+            /* Stop at a key, a multi-child node, or (fixed-length) a leaf parent */
+            if (h->iskey || (!h->iscompr && h->size != 1) ||
+                raxSlotsAreValues(rax, dh + raxStepLenNode(h)))
+                break;
             /* Stop here if going to the next node would result into
              * a compressed node larger than h->size can hold. */
             if (comprsize + h->size > RAX_NODE_MAX_SIZE) break;
@@ -1039,14 +1529,16 @@ int raxRemove(rax *rax, unsigned char *s, size_t len, void **old) {
         if (nodes > 1) {
             /* If we can compress, create the new node and populate it. */
             size_t nodesize =
-                sizeof(raxNode)+comprsize+sizeof(raxNode*);
-            raxNode *new = rax_malloc(nodesize);
+                sizeof(raxNode)+comprsize+raxPadding(comprsize)+sizeof(raxNode*);
+            size_t usable;
+            raxNode *new = rax_malloc_usable(nodesize, &usable);
             /* An out of memory here just means we cannot optimize this
              * node, but the tree is left in a consistent state. */
             if (new == NULL) {
                 raxStackFree(&ts);
                 return 1;
             }
+            if (rax->alloc_size) *rax->alloc_size += usable;
             new->iskey = 0;
             new->isnull = 0;
             new->iscompr = 1;
@@ -1058,14 +1550,21 @@ int raxRemove(rax *rax, unsigned char *s, size_t len, void **old) {
              * all the nodes that we'll no longer use. */
             comprsize = 0;
             h = start;
+            dh = dstart;
             while(h->size != 0) {
                 memcpy(new->data+comprsize,h->data,h->size);
                 comprsize += h->size;
                 raxNode **cp = raxNodeLastChildPtr(h);
+                dh += raxStepLenNode(h);
                 raxNode *tofree = h;
                 memcpy(&h,cp,sizeof(h));
-                rax_free(tofree); rax->numnodes--;
-                if (h->iskey || (!h->iscompr && h->size != 1)) break;
+                raxFreeNode(rax,tofree);
+                rax->numnodes--;
+                /* Same stop as the measuring scan above: terminate at a key,
+                 * a multi-child node, or a fixed-length leaf parent. */
+                if (h->iskey || (!h->iscompr && h->size != 1) ||
+                    raxSlotsAreValues(rax, dh + raxStepLenNode(h)))
+                    break;
             }
             debugnode("New node",new);
 
@@ -1090,28 +1589,92 @@ int raxRemove(rax *rax, unsigned char *s, size_t len, void **old) {
     return 1;
 }
 
-/* This is the core of raxFree(): performs a depth-first scan of the
- * tree and releases all the nodes found. */
-void raxRecursiveFree(rax *rax, raxNode *n) {
-    debugnode("free traversing",n);
-    int numchildren = n->iscompr ? 1 : n->size;
-    raxNode **cp = raxNodeLastChildPtr(n);
-    while(numchildren--) {
-        raxNode *child;
-        memcpy(&child,cp,sizeof(child));
-        raxRecursiveFree(rax,child);
-        cp--;
+/* Invoke the appropriate user callback on an inlined value pointer or
+ * a "raw" leaf data pointer. Used by both the depth-tracking and the
+ * variable-length free walkers. */
+static inline void raxFreeInvokeValueCb(void *data,
+                                        void (*free_cb)(void *item),
+                                        void (*free_cb_withctx)(void *item, void *ctx),
+                                        void *ctx) {
+    if (data == NULL) return;
+    if (free_cb_withctx) free_cb_withctx(data, ctx);
+    else if (free_cb) free_cb(data);
+}
+
+/* This is the core of raxFree(): performs an iterative depth-first scan
+ * of the tree and frees all the nodes found. Uses an explicit heap stack
+ * to avoid stack overflow on deep trees. The caller passes exactly one
+ * callback variant and the non-NULL one is invoked. */
+static void raxFreeNodesWithCallback(rax *rax, raxNode *n,
+                                     void (*free_cb)(void *item),
+                                     void (*free_cb_withctx)(void *item, void *ctx),
+                                     void *ctx)
+{
+    raxStack stack, depths;
+    raxStackInit(&stack);
+    raxStackInit(&depths);
+    raxStackPush(&stack, n);
+    raxStackPush(&depths, (void*)(uintptr_t)0);
+
+    while (stack.items > 0) {
+        raxNode *curr = raxStackPop(&stack);
+        size_t depth = (size_t)(uintptr_t)raxStackPop(&depths);
+        debugnode("free traversing", curr);
+
+        int numchildren = curr->iscompr ? 1 : (int)curr->size;
+        raxNode **cp = raxNodeFirstChildPtr(curr);
+
+        size_t child_depth = depth + raxStepLenNode(curr);
+
+        for (int i = 0; i < numchildren; i++) {
+            void *slot;
+            memcpy(&slot, cp + i, sizeof(slot));
+            /* If fixed-length leaf inlining, slots hold values not raxNode*. */
+            if (raxSlotsAreValues(rax, child_depth)) {
+                raxFreeInvokeValueCb(slot, free_cb, free_cb_withctx, ctx);
+            } else {
+                raxStackPush(&stack, slot);
+                raxStackPush(&depths, (void*)(uintptr_t)child_depth);
+            }
+        }
+
+        debugnode("free depth-first", curr);
+        if (curr->iskey && !curr->isnull)
+            raxFreeInvokeValueCb(raxGetData(curr), free_cb, free_cb_withctx, ctx);
+        raxFreeNode(rax, curr);
+        rax->numnodes--;
     }
-    debugnode("free depth-first",n);
-    rax_free(n);
-    rax->numnodes--;
+
+    raxStackFree(&depths);
+    raxStackFree(&stack);
+}
+
+/* Free a whole radix tree, calling the specified callback in order to
+ * free the auxiliary data. */
+void raxFreeWithCallback(rax *rax, void (*free_callback)(void*)) {
+    raxFreeNodesWithCallback(rax, rax->head, free_callback, NULL, NULL);
+    assert(rax->numnodes == 0);
+    size_t *alloc_size = rax->alloc_size;
+    size_t usable;
+    rax_free_usable(rax, &usable);
+    if (alloc_size) *alloc_size -= usable;
+}
+
+/* Free a whole radix tree, calling the specified callback in order to
+ * free the auxiliary data. */
+void raxFreeWithCbAndContext(rax *rax,
+                             void (*free_callback)(void *item, void *ctx), void *ctx) {
+    raxFreeNodesWithCallback(rax, rax->head, NULL, free_callback, ctx);
+    assert(rax->numnodes == 0);
+    size_t *alloc_size = rax->alloc_size;
+    size_t usable;
+    rax_free_usable(rax, &usable);
+    if (alloc_size) *alloc_size -= usable;
 }
 
 /* Free a whole radix tree. */
 void raxFree(rax *rax) {
-    raxRecursiveFree(rax,rax->head);
-    assert(rax->numnodes == 0);
-    rax_free(rax);
+    raxFreeWithCallback(rax,NULL);
 }
 
 /* ------------------------------- Iterator --------------------------------- */
@@ -1126,13 +1689,35 @@ void raxStart(raxIterator *it, rax *rt) {
     it->key = it->key_static_string;
     it->key_max = RAX_ITER_STATIC_LEN;
     it->data = NULL;
+    it->node_cb = NULL;
+    it->privdata = NULL;
+    it->leaf_slot_idx = -1;
     raxStackInit(&it->stack);
+}
+
+/* Update the value associated with the iterator's current position.
+ * Lives at either the leaf parent's slot (fixed-length leaf-inlined) or
+ * the node's value tail (variable-length / non-leaf-parent). Used by
+ * defrag-style callers that have to overwrite the slot value in place
+ * after the iterator stopped on a key. */
+void raxIteratorSetData(raxIterator *it, void *data) {
+    if (it->leaf_slot_idx >= 0) {
+        debugAssert(it->rt->keyFixedLen);
+        debugAssert(it->node != NULL);
+        debugAssert(it->leaf_slot_idx >= 0 && it->leaf_slot_idx < (int)it->node->size);
+        raxLeafParentWriteSlot(it->node, it->leaf_slot_idx, data);
+        it->data = data;
+        return;
+    }
+    raxSetData(it->node, data);
+    it->data = data;
 }
 
 /* Append characters at the current key string of the iterator 'it'. This
  * is a low level function used to implement the iterator, not callable by
  * the user. Returns 0 on out of memory, otherwise 1 is returned. */
 int raxIteratorAddChars(raxIterator *it, unsigned char *s, size_t len) {
+    if (len == 0) return 1;
     if (it->key_max < it->key_len+len) {
         unsigned char *old = (it->key == it->key_static_string) ? NULL :
                                                                   it->key;
@@ -1175,7 +1760,7 @@ void raxIteratorDelChars(raxIterator *it, size_t count) {
  * The function returns 1 on success or 0 on out of memory. */
 int raxIteratorNextStep(raxIterator *it, int noup) {
     if (it->flags & RAX_ITER_EOF) {
-        return 0;
+        return 1;
     } else if (it->flags & RAX_ITER_JUST_SEEKED) {
         it->flags &= ~RAX_ITER_JUST_SEEKED;
         return 1;
@@ -1186,32 +1771,66 @@ int raxIteratorNextStep(raxIterator *it, int noup) {
     size_t orig_key_len = it->key_len;
     size_t orig_stack_items = it->stack.items;
     raxNode *orig_node = it->node;
+    int orig_leaf_slot_idx = it->leaf_slot_idx;
 
-    /* Clear the EOF flag: it will be set again if the EOF condition
-     * is still valid. */
-    it->flags &= ~RAX_ITER_EOF;
+    /* Fixed-length leaf inlining: if we are currently parked on a virtual
+     * leaf (leaf_slot_idx >= 0), advance to the next sibling slot within
+     * the same leaf parent, or fall out of the virtual-leaf state and
+     * continue with the standard go-up logic below. */
+    if (it->leaf_slot_idx >= 0) {
+        if (!it->node->iscompr) {
+            int next_idx = it->leaf_slot_idx + 1;
+            if (next_idx < (int)it->node->size) {
+                it->key[it->key_len - 1] = it->node->data[next_idx];
+                it->leaf_slot_idx = next_idx;
+                it->data = raxLeafParentReadSlot(it->node, next_idx);
+                return 1;
+            }
+        }
+        /* No more slots. Exit virtual-leaf state. Standard go-up code
+         * below uses them as `prevchild` and shifts the key correctly. */
+        it->leaf_slot_idx = -1;
+        noup = 1;
+    }
 
     while(1) {
         int children = it->node->iscompr ? 1 : it->node->size;
         if (!noup && children) {
             debugf("GO DEEPER\n");
+            /* Fixed-length leaf inlining: if the next descent would land
+             * at the leaf depth, enter the leaf-parent's first slot as a
+             * virtual leaf instead of dereferencing the slot as raxNode*. */
+            size_t edge_len = raxStepLenNode(it->node);
+            size_t child_depth = it->key_len + edge_len;
+            if (raxSlotsAreValues(it->rt, child_depth)) {
+                /* Append the edge byte(s) for slot 0 (the lex-smallest) */
+                if (!raxIteratorAddChars(it, it->node->data, edge_len)) return 0;
+                it->leaf_slot_idx = 0;
+                it->data = raxLeafParentReadSlot(it->node, 0);
+                return 1;
+            }
+
             /* Seek the lexicographically smaller key in this subtree, which
-             * is the first one found always going torwards the first child
+             * is the first one found always going towards the first child
              * of every successive node. */
             if (!raxStackPush(&it->stack,it->node)) return 0;
             raxNode **cp = raxNodeFirstChildPtr(it->node);
             if (!raxIteratorAddChars(it,it->node->data,
                 it->node->iscompr ? it->node->size : 1)) return 0;
             memcpy(&it->node,cp,sizeof(it->node));
+            /* Call the node callback if any, and replace the node pointer
+             * if the callback returns true. */
+            if (it->node_cb && it->node_cb(&it->node, it->privdata))
+                memcpy(cp,&it->node,sizeof(it->node));
             /* For "next" step, stop every time we find a key along the
-             * way, since the key is lexicograhically smaller compared to
+             * way, since the key is lexicographically smaller compared to
              * what follows in the sub-children. */
             if (it->node->iskey) {
                 it->data = raxGetData(it->node);
                 return 1;
             }
         } else {
-            /* If we finished exporing the previous sub-tree, switch to the
+            /* If we finished exploring the previous sub-tree, switch to the
              * new one: go upper until a node is found where there are
              * children representing keys lexicographically greater than the
              * current key. */
@@ -1224,6 +1843,7 @@ int raxIteratorNextStep(raxIterator *it, int noup) {
                     it->stack.items = orig_stack_items;
                     it->key_len = orig_key_len;
                     it->node = orig_node;
+                    it->leaf_slot_idx = orig_leaf_slot_idx;
                     return 1;
                 }
                 /* If there are no children at the current node, try parent's
@@ -1252,9 +1872,23 @@ int raxIteratorNextStep(raxIterator *it, int noup) {
                     }
                     if (i != it->node->size) {
                         debugf("SCAN found a new node\n");
+                        /* Fixed-length leaf inlining: at leaf depth slot `i`
+                         * holds an inlined value, not a raxNode pointer.
+                         * Park on the virtual leaf directly. */
+                        if (raxSlotsAreValues(it->rt, it->key_len + 1)) {
+                            if (!raxIteratorAddChars(it, it->node->data+i, 1))
+                                return 0;
+                            it->leaf_slot_idx = i;
+                            it->data = raxLeafParentReadSlot(it->node, i);
+                            return 1;
+                        }
                         raxIteratorAddChars(it,it->node->data+i,1);
                         if (!raxStackPush(&it->stack,it->node)) return 0;
                         memcpy(&it->node,cp,sizeof(it->node));
+                        /* Call the node callback if any, and replace the node
+                         * pointer if the callback returns true. */
+                        if (it->node_cb && it->node_cb(&it->node, it->privdata))
+                            memcpy(cp,&it->node,sizeof(it->node));
                         if (it->node->iskey) {
                             it->data = raxGetData(it->node);
                             return 1;
@@ -1267,11 +1901,24 @@ int raxIteratorNextStep(raxIterator *it, int noup) {
     }
 }
 
-/* Seek the grestest key in the subtree at the current node. Return 0 on
- * out of memory, otherwise 1. This is an helper function for different
- * iteration functions below. */
+/* Seek the greatest key in the subtree at the current node. Return 0 on
+ * out of memory, otherwise 1. On success the iterator is positioned at
+ * the greatest key with `it->data` populated; for fixed-length trees the
+ * position may be a virtual leaf (it->leaf_slot_idx >= 0). */
 int raxSeekGreatest(raxIterator *it) {
     while(it->node->size) {
+        /* Fixed-length leaf inlining: if the next descent lands at the
+         * leaf depth, park on the last virtual leaf instead. */
+        size_t edge_len = raxStepLenNode(it->node);
+        size_t child_depth = it->key_len + edge_len;
+        if (raxSlotsAreValues(it->rt, child_depth)) {
+            int slot_idx = it->node->iscompr ? 0 : (int)it->node->size - 1;
+            if (!raxIteratorAddChars(it, it->node->data + slot_idx, edge_len))
+                return 0;
+            it->leaf_slot_idx = slot_idx;
+            it->data = raxLeafParentReadSlot(it->node, slot_idx);
+            return 1;
+        }
         if (it->node->iscompr) {
             if (!raxIteratorAddChars(it,it->node->data,
                 it->node->size)) return 0;
@@ -1283,15 +1930,19 @@ int raxSeekGreatest(raxIterator *it) {
         if (!raxStackPush(&it->stack,it->node)) return 0;
         memcpy(&it->node,cp,sizeof(it->node));
     }
+    /* Variable-length descent terminated at a leaf raxNode, which by
+     * rax invariants must be a key. */
+    assert(it->node->iskey);
+    it->data = raxGetData(it->node);
     return 1;
 }
 
 /* Like raxIteratorNextStep() but implements an iteration step moving
  * to the lexicographically previous element. The 'noup' option has a similar
- * effect to the one of raxIteratorPrevSte(). */
+ * effect to the one of raxIteratorNextStep(). */
 int raxIteratorPrevStep(raxIterator *it, int noup) {
     if (it->flags & RAX_ITER_EOF) {
-        return 0;
+        return 1;
     } else if (it->flags & RAX_ITER_JUST_SEEKED) {
         it->flags &= ~RAX_ITER_JUST_SEEKED;
         return 1;
@@ -1302,6 +1953,15 @@ int raxIteratorPrevStep(raxIterator *it, int noup) {
     size_t orig_key_len = it->key_len;
     size_t orig_stack_items = it->stack.items;
     raxNode *orig_node = it->node;
+    int orig_leaf_slot_idx = it->leaf_slot_idx;
+
+    /* Fixed-length leaf inlining: leaving a virtual leaf -- clear the
+     * inlined-slot state and force noup=1 so the loop below scans the
+     * leaf parent's own slots for the previous one before going up. */
+    if (it->leaf_slot_idx >= 0) {
+        it->leaf_slot_idx = -1;
+        noup = 1;
+    }
 
     while(1) {
         int old_noup = noup;
@@ -1312,6 +1972,7 @@ int raxIteratorPrevStep(raxIterator *it, int noup) {
             it->stack.items = orig_stack_items;
             it->key_len = orig_key_len;
             it->node = orig_node;
+            it->leaf_slot_idx = orig_leaf_slot_idx;
             return 1;
         }
 
@@ -1343,12 +2004,22 @@ int raxIteratorPrevStep(raxIterator *it, int noup) {
              * find the key lexicographically greater. */
             if (i != -1) {
                 debugf("SCAN found a new node\n");
+                /* Fixed-length leaf inlining: at leaf depth slot `i`
+                 * holds an inlined value, not a raxNode pointer.
+                 * Park on the virtual leaf directly. */
+                if (raxSlotsAreValues(it->rt, it->key_len + 1)) {
+                    if (!raxIteratorAddChars(it, it->node->data+i, 1)) return 0;
+                    it->leaf_slot_idx = i;
+                    it->data = raxLeafParentReadSlot(it->node, i);
+                    return 1;
+                }
                 /* Enter the node we just found. */
                 if (!raxIteratorAddChars(it,it->node->data+i,1)) return 0;
                 if (!raxStackPush(&it->stack,it->node)) return 0;
                 memcpy(&it->node,cp,sizeof(it->node));
-                /* Seek sub-tree max. */
+                /* Seek sub-tree max (raxSeekGreatest populates it->data) */
                 if (!raxSeekGreatest(it)) return 0;
+                return 1;
             }
         }
 
@@ -1369,11 +2040,12 @@ int raxIteratorPrevStep(raxIterator *it, int noup) {
 int raxSeek(raxIterator *it, const char *op, unsigned char *ele, size_t len) {
     int eq = 0, lt = 0, gt = 0, first = 0, last = 0;
 
-    it->stack.items = 0; /* Just resetting. Intialized by raxStart(). */
+    it->stack.items = 0; /* Just resetting. Initialized by raxStart(). */
     it->flags |= RAX_ITER_JUST_SEEKED;
     it->flags &= ~RAX_ITER_EOF;
     it->key_len = 0;
     it->node = NULL;
+    it->leaf_slot_idx = -1;
 
     /* Set flags according to the operator used to perform the seek. */
     if (op[0] == '>') {
@@ -1411,18 +2083,43 @@ int raxSeek(raxIterator *it, const char *op, unsigned char *ele, size_t len) {
          * final node is found. */
         it->node = it->rt->head;
         if (!raxSeekGreatest(it)) return 0;
-        assert(it->node->iskey);
         return 1;
     }
 
     /* We need to seek the specified key. What we do here is to actually
      * perform a lookup, and later invoke the prev/next key code that
      * we already use for iteration. */
-    int splitpos = 0;
-    size_t i = raxLowWalk(it->rt,ele,len,&it->node,NULL,&splitpos,&it->stack);
+    raxNodeLink link;
+    raxLowWalk(it->rt,ele,len,NULL,&link,&it->stack);
+    it->node = link.stopnode;
+    size_t i = link.consumed;
+    int splitpos = link.splitpos;
+    int leafslot = link.leafSlot;
 
     /* Return OOM on incomplete stack info. */
     if (it->stack.oom) return 0;
+
+    /* Fixed-length leaf-parent stop: the walk consumed all `len` bytes and
+     * parked at the leaf parent without descending into the leaf slot. This
+     * only happens on an exact match, so `leafslot` is always a valid slot
+     * (0 for iscompr=1, the matched edge index for iscompr=0). A leaf-parent
+     * *miss* instead breaks the walk with splitpos==0 and falls through to
+     * the common path below, exactly like a normal-node mismatch.
+     *
+     * Position the iterator on the virtual leaf; for non-eq seeks, step
+     * prev/next to advance off it. */
+    if (splitpos == RAX_LEAF_PARENT_STOP) {
+        if (!raxIteratorAddChars(it, ele, len)) return 0;
+        it->leaf_slot_idx = leafslot;
+        it->data = raxLeafParentReadSlot(it->node, leafslot);
+        if (eq) return 1;
+        /* gt/lt without eq: step past the match. */
+        it->flags &= ~RAX_ITER_JUST_SEEKED;
+        if (gt && !raxIteratorNextStep(it, 0)) return 0;
+        if (lt && !raxIteratorPrevStep(it, 0)) return 0;
+        it->flags |= RAX_ITER_JUST_SEEKED;
+        return 1;
+    }
 
     if (eq && i == len && (!it->node->iscompr || splitpos == 0) &&
         it->node->iskey)
@@ -1430,33 +2127,12 @@ int raxSeek(raxIterator *it, const char *op, unsigned char *ele, size_t len) {
         /* We found our node, since the key matches and we have an
          * "equal" condition. */
         if (!raxIteratorAddChars(it,ele,len)) return 0; /* OOM. */
+        it->data = raxGetData(it->node);
     } else if (lt || gt) {
         /* Exact key not found or eq flag not set. We have to set as current
          * key the one represented by the node we stopped at, and perform
-         * a next/prev operation to seek. To reconstruct the key at this node
-         * we start from the parent and go to the current node, accumulating
-         * the characters found along the way. */
-        if (!raxStackPush(&it->stack,it->node)) return 0;
-        for (size_t j = 1; j < it->stack.items; j++) {
-            raxNode *parent = it->stack.stack[j-1];
-            raxNode *child = it->stack.stack[j];
-            if (parent->iscompr) {
-                if (!raxIteratorAddChars(it,parent->data,parent->size))
-                    return 0;
-            } else {
-                raxNode **cp = raxNodeFirstChildPtr(parent);
-                unsigned char *p = parent->data;
-                while(1) {
-                    raxNode *aux;
-                    memcpy(&aux,cp,sizeof(aux));
-                    if (aux == child) break;
-                    cp++;
-                    p++;
-                }
-                if (!raxIteratorAddChars(it,p,1)) return 0;
-            }
-        }
-        raxStackPop(&it->stack);
+         * a next/prev operation to seek. */
+        raxIteratorAddChars(it, ele, i-splitpos);
 
         /* We need to set the iterator in the correct state to call next/prev
          * step in order to seek the desired element. */
@@ -1515,11 +2191,27 @@ int raxSeek(raxIterator *it, const char *op, unsigned char *ele, size_t len) {
             /* If there was no mismatch we are into a node representing the
              * key, (but which is not a key or the seek operator does not
              * include 'eq'), or we stopped in the middle of a compressed node
-             * after processing all the key. Cotinue iterating as this was
+             * after processing all the key. Continue iterating as this was
              * a legitimate key we stopped at. */
             it->flags &= ~RAX_ITER_JUST_SEEKED;
-            if (gt && !raxIteratorNextStep(it,0)) return 0;
-            if (lt && !raxIteratorPrevStep(it,0)) return 0;
+            if (it->node->iscompr && it->node->iskey && splitpos && lt) {
+                /* If we stopped in the middle of a compressed node with
+                 * perfect match, and the condition is to seek a key "<" than
+                 * the specified one, then if this node is a key it already
+                 * represents our match. For instance we may have nodes:
+                 *
+                 * "f" -> "oobar" = 1 -> "" = 2
+                 *
+                 * Representing keys "f" = 1, "foobar" = 2. A seek for
+                 * the key < "foo" will stop in the middle of the "oobar"
+                 * node, but will be our match, representing the key "f".
+                 *
+                 * So in that case, we don't seek backward. */
+                it->data = raxGetData(it->node);
+            } else {
+                if (gt && !raxIteratorNextStep(it,0)) return 0;
+                if (lt && !raxIteratorPrevStep(it,0)) return 0;
+            }
             it->flags |= RAX_ITER_JUST_SEEKED; /* Ignore next call. */
         }
     } else {
@@ -1571,7 +2263,7 @@ int raxPrev(raxIterator *it) {
  * tree, expect a disappointing distribution. A random walk produces good
  * random elements if the tree is not sparse, however in the case of a radix
  * tree certain keys will be reported much more often than others. At least
- * this function should be able to expore every possible element eventually. */
+ * this function should be able to explore every possible element eventually. */
 int raxRandomWalk(raxIterator *it, size_t steps) {
     if (it->rt->numele == 0) {
         it->flags |= RAX_ITER_EOF;
@@ -1579,23 +2271,47 @@ int raxRandomWalk(raxIterator *it, size_t steps) {
     }
 
     if (steps == 0) {
-        size_t fle = floor(log(it->rt->numele));
+        size_t fle = 1+floor(log(it->rt->numele));
         fle *= 2;
         steps = 1 + rand() % fle;
     }
 
     raxNode *n = it->node;
-    while(steps > 0 || !n->iskey) {
+    while(steps > 0 || (!n->iskey && it->leaf_slot_idx < 0)) {
+        /* A fixed-length inlined value is a virtual leaf: logically it has no
+         * children, even though it->node points to the leaf parent whose slots
+         * contain values. Move back to that parent before selecting the next
+         * edge. Otherwise the value slots could be interpreted as raxNode
+         * pointers when the walk continues from an already-positioned leaf. */
+        if (it->leaf_slot_idx >= 0) {
+            it->leaf_slot_idx = -1;
+            int todel = n->iscompr ? n->size : 1;
+            raxIteratorDelChars(it,todel);
+            continue;
+        }
+
         int numchildren = n->iscompr ? 1 : n->size;
         int r = rand() % (numchildren+(n != it->rt->head));
 
         if (r == numchildren) {
-            /* Go up to parent. */
+            /* Go up to the real parent. The virtual-leaf case was normalized
+             * at the beginning of the loop. */
             n = raxStackPop(&it->stack);
             int todel = n->iscompr ? n->size : 1;
             raxIteratorDelChars(it,todel);
         } else {
-            /* Select a random child. */
+            /* Select a random child. Fixed-length: if descent lands at
+             * leaf depth, park on the chosen slot as a virtual leaf. */
+            size_t child_depth = it->key_len + raxStepLenNode(n);
+            if (raxSlotsAreValues(it->rt, child_depth)) {
+                uint32_t slot = n->iscompr ? 0 : r;
+                uint32_t size = n->iscompr ? n->size : 1;
+                if (!raxIteratorAddChars(it, n->data + slot, size)) return 0;
+                it->data = raxLeafParentReadSlot(n, slot);
+                it->leaf_slot_idx = slot;
+                if (steps > 0) steps--; /* virtual leaves count as keys */
+                continue;
+            }
             if (n->iscompr) {
                 if (!raxIteratorAddChars(it,n->data,n->size)) return 0;
             } else {
@@ -1608,6 +2324,8 @@ int raxRandomWalk(raxIterator *it, size_t steps) {
         if (n->iskey) steps--;
     }
     it->node = n;
+    /* When parked on a virtual leaf the data was set on slot entry */
+    if (it->leaf_slot_idx < 0) it->data = raxGetData(it->node);
     return 1;
 }
 
@@ -1618,8 +2336,8 @@ int raxCompare(raxIterator *iter, const char *op, unsigned char *key, size_t key
     int eq = 0, lt = 0, gt = 0;
 
     if (op[0] == '=' || op[1] == '=') eq = 1;
-    if (op[1] == '>') gt = 1;
-    else if (op[1] == '<') lt = 1;
+    if (op[0] == '>') gt = 1;
+    else if (op[0] == '<') lt = 1;
     else if (op[1] != '=') return 0; /* Syntax error. */
 
     size_t minlen = key_len < iter->key_len ? key_len : iter->key_len;
@@ -1634,7 +2352,8 @@ int raxCompare(raxIterator *iter, const char *op, unsigned char *key, size_t key
         if (eq && key_len == iter->key_len) return 1;
         else if (lt) return iter->key_len < key_len;
         else if (gt) return iter->key_len > key_len;
-    } if (cmp > 0) {
+        else return 0; /* Avoid warning, just 'eq' is handled before. */
+    } else if (cmp > 0) {
         return gt ? 1 : 0;
     } else /* (cmp < 0) */ {
         return lt ? 1 : 0;
@@ -1647,10 +2366,23 @@ void raxStop(raxIterator *it) {
     raxStackFree(&it->stack);
 }
 
+/* Return if the iterator is in an EOF state. This happens when raxSeek()
+ * failed to seek an appropriate element, so that raxNext() or raxPrev()
+ * will return zero, or when an EOF condition was reached while iterating
+ * with raxNext() and raxPrev(). */
+int raxEOF(raxIterator *it) {
+    return it->flags & RAX_ITER_EOF;
+}
+
+/* Return the number of elements inside the radix tree. */
+uint64_t raxSize(rax *rax) {
+    return rax->numele;
+}
+
 /* ----------------------------- Introspection ------------------------------ */
 
 /* This function is mostly used for debugging and learning purposes.
- * It shows an ASCII representation of a tree on standard output, outling
+ * It shows an ASCII representation of a tree on standard output, outline
  * all the nodes and the contained keys.
  *
  * The representation is as follow:
@@ -1660,7 +2392,7 @@ void raxStop(raxIterator *it) {
  *  [abc]=0x12345678 (node is a key, pointing to value 0x12345678)
  *  [] (a normal empty node)
  *
- *  Children are represented in new idented lines, each children prefixed by
+ *  Children are represented in new indented lines, each children prefixed by
  *  the "`-(x)" string, where "x" is the edge byte.
  *
  *  [abc]
@@ -1716,7 +2448,8 @@ void raxShow(rax *rax) {
 
 /* Used by debugnode() macro to show info about a given node. */
 void raxDebugShowNode(const char *msg, raxNode *n) {
-    printf("%s: %p [%.*s] key:%d size:%d children:",
+    if (raxDebugMsg == 0) return;
+    printf("%s: %p [%.*s] key:%u size:%u children:",
         msg, (void*)n, (int)n->size, (char*)n->data, n->iskey, n->size);
     int numcld = n->iscompr ? 1 : n->size;
     raxNode **cldptr = raxNodeLastChildPtr(n) - (numcld-1);
@@ -1730,4 +2463,566 @@ void raxDebugShowNode(const char *msg, raxNode *n) {
     fflush(stdout);
 }
 
+/* Touch all the nodes of a tree returning a check sum. This is useful
+ * in order to make Valgrind detect if there is something wrong while
+ * reading the data structure.
+ *
+ * This function was used in order to identify Rax bugs after a big refactoring
+ * using this technique:
+ *
+ * 1. The rax-test is executed using Valgrind, adding a printf() so that for
+ *    the fuzz tester we see what iteration in the loop we are in.
+ * 2. After every modification of the radix tree made by the fuzz tester
+ *    in rax-test.c, we add a call to raxTouch().
+ * 3. Now as soon as an operation will corrupt the tree, raxTouch() will
+ *    detect it (via Valgrind) immediately. We can add more calls to narrow
+ *    the state.
+ * 4. At this point a good idea is to enable Rax debugging messages immediately
+ *    before the moment the tree is corrupted, to see what happens.
+ */
+unsigned long raxTouch(raxNode *n) {
+    debugf("Touching %p\n", (void*)n);
+    unsigned long sum = 0;
+    if (n->iskey) {
+        sum += (unsigned long)raxGetData(n);
+    }
 
+    int numchildren = n->iscompr ? 1 : n->size;
+    raxNode **cp = raxNodeFirstChildPtr(n);
+    int count = 0;
+    for (int i = 0; i < numchildren; i++) {
+        if (numchildren > 1) {
+            sum += (long)n->data[i];
+        }
+        raxNode *child;
+        memcpy(&child,cp,sizeof(child));
+        if (child == (void*)0x65d1760) count++;
+        if (count > 1) exit(1);
+        sum += raxTouch(child);
+        cp++;
+    }
+    return sum;
+}
+
+/* The rest of this file is test cases and test helpers. */
+#ifdef REDIS_TEST
+#include "testhelp.h"
+#include <stdlib.h>
+
+#define UNUSED(x) (void)(x)
+
+#define yell(str, ...) printf("ERROR! " str "\n\n", __VA_ARGS__)
+
+#define ERR(x, ...)                                                            \
+    do {                                                                       \
+        printf("%s:%s:%d:\t", __FILE__, __func__, __LINE__);                   \
+        printf("ERROR! " x "\n", __VA_ARGS__);                                 \
+        err++;                                                                 \
+    } while (0)
+
+#define TEST(name) printf("test — %s\n", name);
+
+/* Verify rax memory accounting by calculating actual memory usage */
+static int _rax_verify_alloc_size(rax *rax, size_t have) {
+    int errors = 0;
+    size_t want = rax_malloc_usable_size(rax);
+    raxNode *node;
+    raxStack stack;
+
+    raxStackInit(&stack);
+    raxStackPush(&stack, rax->head);
+    while ((node = raxStackPop(&stack))) {
+        want += rax_malloc_usable_size(node);
+        if (!node->iscompr) {
+            /* Non-compressed node: add all children */
+            for (int i = 0; i < node->size; i++) {
+                raxNode **child = raxNodeLastChildPtr(node) - i;
+                if (*child) raxStackPush(&stack, *child);
+            }
+        } else {
+            /* Compressed node: add single child */
+            raxNode **child = raxNodeLastChildPtr(node);
+            if (*child) raxStackPush(&stack, *child);
+        }
+    }
+    raxStackFree(&stack);
+
+    if (want != have) {
+        yell("rax alloc_size is wrong: want: %zu, have: %zu\n", want, have);
+        errors++;
+    }
+
+    return errors;
+}
+
+static void *createTestValue(size_t size) {
+    size_t usable;
+    void *val = rax_malloc_usable(size, &usable);
+    memset(val, 'A', usable);
+    return val;
+}
+
+/* qsort comparator for the fixed-length range-seek test below: compares
+ * _rax_test_klen-byte keys, matching the rax's lexicographic order. */
+static int _rax_test_klen = 0;
+static int _rax_test_cmpkey(const void *a, const void *b) {
+    return memcmp(a, b, _rax_test_klen);
+}
+
+int raxTest(int argc, char **argv, int flags) {
+    UNUSED(argc);
+    UNUSED(argv);
+    UNUSED(flags);
+
+    int err = 0;
+
+    TEST("verify raxAllocSize() after raxInsert()/raxRemove()") {
+        size_t alloc_size = 0;
+        rax *r = raxNewEx(0, &alloc_size, 0);
+
+        /* Insert values and verify accounting */
+        void *val1 = createTestValue(100);
+        assert(raxInsert(r, (unsigned char*)"key1", 4, val1, NULL) == 1);
+        err += _rax_verify_alloc_size(r, alloc_size);
+
+        void *val2 = createTestValue(200);
+        assert(raxInsert(r, (unsigned char*)"key2", 4, val2, NULL) == 1);
+        err += _rax_verify_alloc_size(r, alloc_size);
+
+        void *val3 = createTestValue(10);
+        assert(raxInsert(r, (unsigned char*)"3yek", 4, val3, NULL) == 1);
+        err += _rax_verify_alloc_size(r, alloc_size);
+
+        /* Remove a value and verify */
+        void *removed;
+        assert(raxRemove(r, (unsigned char*)"key1", 4, &removed) == 1);
+        rax_free(removed);
+        err += _rax_verify_alloc_size(r, alloc_size);
+
+        raxFreeWithCallback(r, rax_free);
+    }
+
+    TEST("verify raxAllocSize() when replacing existing key") {
+        size_t alloc_size = 0;
+        rax *r = raxNewEx(0, &alloc_size, 0);
+
+        void *val1 = createTestValue(100);
+        assert(raxInsert(r, (unsigned char*)"key", 3, val1, NULL) == 1);
+        err += _rax_verify_alloc_size(r, alloc_size);
+
+        /* Update with different sized value */
+        void *val2 = createTestValue(300);
+        void *old;
+        assert(raxInsert(r, (unsigned char*)"key", 3, val2, &old) == 0);
+        rax_free(old);
+        err += _rax_verify_alloc_size(r, alloc_size);
+
+        raxFreeWithCallback(r, rax_free);
+    }
+
+    TEST("raxNodeLink: insert paths via raxFindLink + raxInsertAt") {
+        /* Three not-found scenarios in one tree: empty insert, ALGO 1
+         * mid-prefix split, ALGO 2 end-of-prefix split. */
+        rax *r = raxNew();
+        void *vK  = createTestValue(8);
+        void *vAB = createTestValue(8);
+        void *vXX = createTestValue(8);
+        void *vAN = createTestValue(8);
+        raxNodeLink link;
+        void *val;
+
+        /* (a) Empty tree: link points at head, InsertAt commits. */
+        assert(raxFindLink(r, (unsigned char*)"K", 1, NULL, &link) == 0);
+        assert(raxInsertAt(r, (unsigned char*)"K", 1, vK, NULL, &link) == 1);
+        assert(raxFind(r, (unsigned char*)"K", 1, &val) == 1 && val == vK);
+
+        /* Seed compressed node "ANNIBALE". */
+        assert(raxInsert(r, (unsigned char*)"ANNIBALE", 8, vAB, NULL) == 1);
+
+        /* (b) ALGO 1: mismatch mid-prefix. "ANXX" stops at splitpos > 0
+         * inside the compressed "ANNIBALE" node. */
+        assert(raxFindLink(r, (unsigned char*)"ANXX", 4, NULL, &link) == 0);
+        assert(link.stopnode->iscompr && link.splitpos > 0);
+        assert(raxInsertAt(r, (unsigned char*)"ANXX", 4, vXX, NULL, &link) == 1);
+
+        /* (c) ALGO 2: query exhausts mid-prefix (i == len, splitpos > 0). */
+        assert(raxFindLink(r, (unsigned char*)"ANNI", 4, NULL, &link) == 0);
+        assert(raxInsertAt(r, (unsigned char*)"ANNI", 4, vAN, NULL, &link) == 1);
+
+        /* All four keys reachable with the correct values. */
+        assert(raxFind(r, (unsigned char*)"K",        1, &val) == 1 && val == vK);
+        assert(raxFind(r, (unsigned char*)"ANNIBALE", 8, &val) == 1 && val == vAB);
+        assert(raxFind(r, (unsigned char*)"ANXX",     4, &val) == 1 && val == vXX);
+        assert(raxFind(r, (unsigned char*)"ANNI",     4, &val) == 1 && val == vAN);
+        raxFreeWithCallback(r, rax_free);
+    }
+
+    TEST("raxNodeLink: existing-key paths (overwrite vs try-insert vs not-found)") {
+        /* Three exists/not-exists scenarios on the same tree. */
+        rax *r = raxNew();
+        void *v1 = createTestValue(8), *v2 = createTestValue(8);
+        void *v3 = createTestValue(8), *vNew = createTestValue(8);
+        assert(raxInsert(r, (unsigned char*)"FOO", 3, v1, NULL) == 1);
+        assert(raxInsert(r, (unsigned char*)"BAR", 3, v3, NULL) == 1);
+
+        raxNodeLink link;
+        void *val, *existing = NULL;
+
+        /* (a) Overwrite path: FindLink returns 1, caller calls InsertAt
+         * anyway -- value replaced, *old carries the prior pointer. */
+        assert(raxFindLink(r, (unsigned char*)"FOO", 3, &existing, &link) == 1);
+        assert(existing == v1);
+        void *old = NULL;
+        assert(raxInsertAt(r, (unsigned char*)"FOO", 3, v2, &old, &link) == 0);
+        assert(old == v1);
+        assert(raxFind(r, (unsigned char*)"FOO", 3, &val) == 1 && val == v2);
+        rax_free(v1);
+
+        /* (b) Try-insert path: FindLink reports existing -- caller
+         * skips InsertAt entirely. No overwrite flag needed. */
+        existing = NULL;
+        assert(raxFindLink(r, (unsigned char*)"BAR", 3, &existing, &link) == 1);
+        assert(existing == v3);
+        /* Deliberately skip raxInsertAt -- v3 must survive. */
+        rax_free(vNew);
+        assert(raxFind(r, (unsigned char*)"BAR", 3, &val) == 1 && val == v3);
+
+        /* (c) Not-found: FindLink on a missing key returns 0 and leaves
+         * the tree untouched (caller didn't commit). */
+        assert(raxFindLink(r, (unsigned char*)"BAZ", 3, NULL, &link) == 0);
+        assert(raxFind(r, (unsigned char*)"BAZ", 3, NULL) == 0);
+        assert(raxSize(r) == 2);
+        raxFreeWithCallback(r, rax_free);
+    }
+
+    TEST("inline-leaf: fixed-length rax tree round-trips and saves numnodes") {
+        rax *r = raxNewEx(0, NULL, 8);
+
+        /* Value of each key in rax: k1->1, k2->2, k3->3, for easy verification */
+        #define V(n) ((void*)(uintptr_t)(n))
+        unsigned char k1[8] = {'k','e','y','0','0','0','0','1'};
+        unsigned char k2[8] = {'k','e','y','0','0','0','0','2'};
+        unsigned char k3[8] = {'z','z','z','z','z','z','z','z'};
+
+        assert(raxInsert(r, k1, 8, V(1), NULL) == 1);
+        assert(r->numnodes == 1);
+        assert(raxFind(r, k1, 8, NULL) == 1);
+
+        assert(raxInsert(r, k2, 8, V(2), NULL) == 1);
+        assert(r->numnodes == 2);
+
+        /* k3 diverges from k1/k2 at byte 0, so the shared "key0000" prefix
+         * splits into a root branch node ('k','z'); the 'k' side keeps the
+         * "ey0000" prefix + the '1'/'2' leaf parent, and the 'z' side gets a
+         * "zzzzzzz" leaf parent. Four nodes total. */
+        assert(raxInsert(r, k3, 8, V(3), NULL) == 1);
+        assert(raxSize(r) == 3);
+        assert(r->numnodes == 4);
+
+        void *val = NULL;
+        assert(raxFind(r, k1, 8, &val) == 1 && val == V(1));
+        assert(raxFind(r, k2, 8, &val) == 1 && val == V(2));
+        assert(raxFind(r, k3, 8, &val) == 1 && val == V(3));
+
+        /* Overwrite via raxInsert returns 0 (existed) and surfaces the old value */
+        void *old = NULL;
+        assert(raxInsert(r, k1, 8, V(99), &old) == 0);
+        assert(old == V(1));
+        assert(raxFind(r, k1, 8, &val) == 1 && val == V(99));
+
+        /* Remove returns the inlined value and shrinks the tree. */
+        void *removed = NULL;
+        assert(raxRemove(r, k2, 8, &removed) == 1 && removed == V(2));
+        assert(raxSize(r) == 2);
+        assert(raxFind(r, k2, 8, NULL) == 0);
+
+        assert(raxRemove(r, k3, 8, &removed) == 1 && removed == V(3));
+        assert(raxRemove(r, k1, 8, &removed) == 1 && removed == V(99));
+        assert(raxSize(r) == 0);
+        raxFree(r);
+    }
+
+    TEST("inline-leaf: dense leaf parent (256 distinct edge bytes)") {
+        rax *r = raxNewEx(0, NULL, 2);
+        unsigned char k[2] = {'P', 0};
+        for (int i = 0; i < 256; i++) {
+            k[1] = (unsigned char)i;
+            assert(raxInsert(r, k, 2, (void*)(uintptr_t)(i+1), NULL) == 1);
+            /* First key fuses into a single leaf-inlined node. The second key
+             * splits off the "P" prefix and creates the dense leaf parent;
+             * every later key just adds a slot to it, so the count stays at 2. */
+            assert(r->numnodes == (i == 0 ? 1 : 2));
+        }
+        assert(raxSize(r) == 256);
+        for (int i = 0; i < 256; i++) {
+            k[1] = (unsigned char)i;
+            void *val = NULL;
+            assert(raxFind(r, k, 2, &val) == 1 && val == (void*)(uintptr_t)(i+1));
+        }
+        /* Remove half (even bytes) and verify the other half still finds. */
+        for (int i = 0; i < 256; i += 2) {
+            k[1] = (unsigned char)i;
+            void *removed = NULL;
+            assert(raxRemove(r, k, 2, &removed) == 1 &&
+                   removed == (void*)(uintptr_t)(i+1));
+        }
+        assert(raxSize(r) == 128);
+        for (int i = 1; i < 256; i += 2) {
+            k[1] = (unsigned char)i;
+            void *val = NULL;
+            assert(raxFind(r, k, 2, &val) == 1 && val == (void*)(uintptr_t)(i+1));
+        }
+        raxFree(r);
+    }
+
+    TEST("inline-leaf: forward iteration through multiple inlined values") {
+        rax *r = raxNewEx(0, NULL, 16);
+        unsigned char keys[5][16];
+        for (int i = 0; i < 5; i++) {
+            memcpy(keys[i], "ssssmsmsmsmsmsms", 16);
+            keys[i][15] = (unsigned char)i;
+            assert(raxInsert(r, keys[i], 16, (void*)(uintptr_t)(i+1), NULL) == 1);
+        }
+        assert(raxSize(r) == 5);
+
+        raxIterator ri;
+        raxStart(&ri, r);
+        assert(raxSeek(&ri, "^", NULL, 0) == 1);
+        int yielded = 0;
+        while (raxNext(&ri)) {
+            assert(ri.key_len == 16);
+            assert(ri.data == (void*)(uintptr_t)(yielded+1));
+            assert(ri.key[15] == (unsigned char)yielded);
+            yielded++;
+        }
+        assert(yielded == 5);
+        raxStop(&ri);
+
+        /* Reverse iteration. */
+        raxStart(&ri, r);
+        assert(raxSeek(&ri, "$", NULL, 0) == 1);
+        int reverse_yielded = 5;
+        while (raxPrev(&ri)) {
+            reverse_yielded--;
+            assert(ri.key_len == 16);
+            assert(ri.data == (void*)(uintptr_t)(reverse_yielded+1));
+            assert(ri.key[15] == (unsigned char)reverse_yielded);
+        }
+        assert(reverse_yielded == 0);
+        raxStop(&ri);
+
+        /* raxSeek "=" exact match on a virtual leaf. */
+        raxStart(&ri, r);
+        assert(raxSeek(&ri, "=", keys[2], 16) == 1);
+        assert(raxEOF(&ri) == 0);
+        assert(ri.data == (void*)(uintptr_t)3);
+        raxStop(&ri);
+
+        raxFree(r);
+    }
+
+    TEST("inline-leaf: iscompr=1 leaf parents (Streams-shape forward iter)") {
+        /* Build a tree that mirrors the Streams 16-byte streamID shape:
+         * 3 keys differing only at byte 7 produce iscompr=1 leaf parents
+         * (compressed last 8 bytes) under an iscompr=0 splitnode. */
+        rax *r = raxNewEx(0, NULL, 16);
+        unsigned char keys[3][16];
+        for (int i = 0; i < 3; i++) {
+            memset(keys[i], 0, 16);
+            keys[i][7] = (unsigned char)(i + 1);   /* 1-0, 2-0, 3-0 streamIDs */
+            assert(raxInsert(r, keys[i], 16, (void*)(uintptr_t)(i+1), NULL) == 1);
+        }
+        assert(raxSize(r) == 3);
+
+        raxIterator ri;
+        raxStart(&ri, r);
+        assert(raxSeek(&ri, "^", NULL, 0) == 1);
+        int n = 0;
+        while (raxNext(&ri)) {
+            assert(ri.key_len == 16);
+            assert(ri.data == (void*)(uintptr_t)(n+1));
+            assert(memcmp(ri.key, keys[n], 16) == 0);
+            n++;
+        }
+        assert(n == 3);
+        raxStop(&ri);
+
+        /* Reverse. */
+        raxStart(&ri, r);
+        assert(raxSeek(&ri, "$", NULL, 0) == 1);
+        n = 3;
+        while (raxPrev(&ri)) {
+            n--;
+            assert(ri.key_len == 16);
+            assert(ri.data == (void*)(uintptr_t)(n+1));
+            assert(memcmp(ri.key, keys[n], 16) == 0);
+        }
+        assert(n == 0);
+        raxStop(&ri);
+
+        /* Re-create the iterator multiple times -- mirrors XRANGE which
+         * starts a fresh iterator for each call and steps until EOF. */
+        for (int restart = 0; restart < 3; restart++) {
+            raxStart(&ri, r);
+            assert(raxSeek(&ri, "^", NULL, 0) == 1);
+            int yielded = 0;
+            while (raxNext(&ri)) {
+                assert(ri.key_len == 16);
+                assert(ri.data == (void*)(uintptr_t)(yielded+1));
+                yielded++;
+            }
+            assert(yielded == 3);
+            raxStop(&ri);
+        }
+
+        raxFree(r);
+    }
+
+    TEST("inline-leaf: random walk from a virtual leaf") {
+        /* A single fixed-length key is stored as an iscompr=1 leaf parent at
+         * the root. Seeking positions the iterator on its virtual leaf. A
+         * subsequent random walk must first move back to the leaf parent;
+         * treating its value slot as a child raxNode would crash. Multiple
+         * steps exercise leaving and re-entering the same virtual leaf. */
+        rax *r = raxNewEx(0, NULL, 8);
+        unsigned char key[8] = {'A','A','A','A','A','A','A','A'};
+        void *value = (void*)(uintptr_t)1;
+        assert(raxInsert(r, key, sizeof(key), value, NULL) == 1);
+
+        raxIterator ri;
+        raxStart(&ri, r);
+        assert(raxSeek(&ri, "^", NULL, 0) == 1);
+        assert(ri.leaf_slot_idx == 0);
+        assert(raxRandomWalk(&ri, 8) == 1);
+        assert(ri.key_len == sizeof(key));
+        assert(memcmp(ri.key, key, sizeof(key)) == 0);
+        assert(ri.data == value);
+        assert(ri.leaf_slot_idx == 0);
+        raxStop(&ri);
+
+        raxFree(r);
+    }
+
+    TEST("inline-leaf: delete triggers recompression into a sibling leaf parent") {
+        /* k1 and k2 diverge at byte 1, each with a long unique suffix:
+         *   "A" -> {A,B branch} -> "AAAAAA"(leaf parent, v1)   = k1
+         *                       -> "BBBBBB"(leaf parent, v2)   = k2
+         * Deleting k1 drops the branch to a single child and triggers
+         * downward recompression, which must walk INTO the surviving B-side
+         * chain and STOP at its singleton leaf parent without dereferencing
+         * the inlined value as a raxNode* (the case the depth guard protects;
+         * before the guard this path corrupted/crashed). */
+        rax *r = raxNewEx(0, NULL, 8);
+        unsigned char k1[8] = {'A','A','A','A','A','A','A','A'};
+        unsigned char k2[8] = {'A','B','B','B','B','B','B','B'};
+        assert(raxInsert(r, k1, 8, (void*)(uintptr_t)1, NULL) == 1);
+        assert(raxInsert(r, k2, 8, (void*)(uintptr_t)2, NULL) == 1);
+        assert(raxSize(r) == 2);
+
+        void *removed = NULL;
+        assert(raxRemove(r, k1, 8, &removed) == 1 && removed == (void*)(uintptr_t)1);
+
+        /* Surviving key still resolves; deleted key is gone. */
+        void *val = NULL;
+        assert(raxFind(r, k2, 8, &val) == 1 && val == (void*)(uintptr_t)2);
+        assert(raxFind(r, k1, 8, NULL) == 0);
+        assert(raxSize(r) == 1);
+        /* Recompression fused "A" + the single-child branch into one node, so
+         * only the fused prefix node + the leaf parent remain. (Without
+         * recompression the dropped-to-one-child branch would linger: 3.) */
+        assert(r->numnodes == 2);
+
+        /* Iteration still yields exactly k2. */
+        raxIterator ri;
+        raxStart(&ri, r);
+        assert(raxSeek(&ri, "^", NULL, 0) == 1);
+        assert(raxNext(&ri) == 1 && ri.key_len == 8 &&
+               memcmp(ri.key, k2, 8) == 0 && ri.data == (void*)(uintptr_t)2);
+        assert(raxNext(&ri) == 0);
+        raxStop(&ri);
+
+        assert(raxRemove(r, k2, 8, &removed) == 1 && removed == (void*)(uintptr_t)2);
+        assert(raxSize(r) == 0);
+        raxFree(r);
+    }
+
+    TEST("inline-leaf: range seeks (>,>=,<,<=) match brute-force reference") {
+        /* Range seeks on a fixed-length tree exercise raxSeek's leaf-parent
+         * stop and next/prev step machinery across virtual leaves. Random
+         * keys at these lengths produce both dense (iscompr=0) and singleton
+         * (iscompr=1) leaf parents; validate against a sorted array + EOF. */
+        enum { MAXK = 400 };
+        static const int klens[] = {3, 4, 8};
+        static const char *ops[4] = {">", ">=", "<", "<="};
+        uint32_t seed = 0xC0FFEEu;
+        #define NEXTRAND() (seed = seed*1664525u + 1013904223u)
+
+        for (size_t ki = 0; ki < sizeof(klens)/sizeof(klens[0]); ki++) {
+            int klen = klens[ki];
+            _rax_test_klen = klen;
+            for (int round = 0; round < 40; round++) {
+                rax *r = raxNewEx(0, NULL, klen);
+                unsigned char keys[MAXK][8];
+                int cnt = 0;
+                int target = 1 + (int)(NEXTRAND() % MAXK);
+                for (int i = 0; i < target; i++) {
+                    unsigned char k[8];
+                    for (int b = 0; b < klen; b++) k[b] = NEXTRAND() & 0xff;
+                    if (raxFind(r, k, klen, NULL)) continue; /* skip dup */
+                    memcpy(keys[cnt], k, klen);
+                    assert(raxInsert(r, k, klen, (void*)(uintptr_t)(cnt+1),
+                                     NULL) == 1);
+                    cnt++;
+                }
+                qsort(keys, cnt, 8, _rax_test_cmpkey);
+
+                for (int t = 0; t < 30; t++) {
+                    unsigned char probe[8];
+                    if ((t & 1) && cnt) {
+                        memcpy(probe, keys[NEXTRAND()%cnt], klen); /* hit */
+                    } else {
+                        for (int b = 0; b < klen; b++) probe[b]=NEXTRAND()&0xff;
+                    }
+                    for (int o = 0; o < 4; o++) {
+                        int gt = ops[o][0] == '>';
+                        int eq = ops[o][1] == '=';
+                        /* Brute-force the expected result, -1 means EOF. */
+                        int exp = -1;
+                        if (gt) {
+                            for (int i = 0; i < cnt; i++) {
+                                int c = memcmp(keys[i], probe, klen);
+                                if (c > 0 || (eq && c == 0)) { exp = i; break; }
+                            }
+                        } else {
+                            for (int i = cnt-1; i >= 0; i--) {
+                                int c = memcmp(keys[i], probe, klen);
+                                if (c < 0 || (eq && c == 0)) { exp = i; break; }
+                            }
+                        }
+                        raxIterator ri;
+                        raxStart(&ri, r);
+                        assert(raxSeek(&ri, ops[o], probe, klen) == 1);
+                        int has = raxNext(&ri);
+                        if (exp < 0) {
+                            assert(!has); /* sought past the end -> EOF */
+                        } else {
+                            assert(has && ri.key_len == (size_t)klen &&
+                                   memcmp(ri.key, keys[exp], klen) == 0);
+                        }
+                        raxStop(&ri);
+                    }
+                }
+                raxFree(r); /* values are integers, not heap pointers */
+            }
+        }
+    }
+
+    if (!err)
+        printf("ALL TESTS PASSED!\n");
+    else
+        ERR("Sorry, not all tests passed!  In fact, %d tests failed.", err);
+
+    return err;
+}
+
+#endif

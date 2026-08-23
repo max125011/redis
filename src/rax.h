@@ -1,3 +1,13 @@
+/* Rax -- A radix tree implementation.
+ *
+ * Copyright (c) 2017-Present, Redis Ltd.
+ * All rights reserved.
+ *
+ * Licensed under your choice of (a) the Redis Source Available License 2.0
+ * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+ * GNU Affero General Public License v3 (AGPLv3).
+ */
+
 #ifndef RAX_H
 #define RAX_H
 
@@ -28,7 +38,7 @@
  * successive nodes having a single child are "compressed" into the node
  * itself as a string of characters, each representing a next-level child,
  * and only the link to the node representing the last character node is
- * provided inside the representation. So the above representation is turend
+ * provided inside the representation. So the above representation is turned
  * into:
  *
  *                  ["foo"] ""
@@ -62,6 +72,16 @@
  * is created (the chain must also not include nodes that represent keys),
  * it must be compressed back into a single node.
  *
+ * FIXED LENGTH KEY OPT
+ * --------------------
+ * Another optimization applies when all keys share a known fixed length, set at 
+ * construction via raxNewEx()'s keyFixedLen. In that mode the leaf raxNode is 
+ * skipped: the value pointer is stored directly in the parent's child-pointer 
+ * slot. The node at depth keyFixedLen-1 becomes a "leaf parent" whose slots hold 
+ * inlined values instead of raxNode pointers, saving one raxNode allocation per 
+ * key. In fact, fixed length keys are a common case in Redis so this 
+ * implementation is very useful.
+ *
  */
 
 #define RAX_NODE_MAX_SIZE ((1<<29)-1)
@@ -77,24 +97,24 @@ typedef struct raxNode {
      * Note how the character is not stored in the children but in the
      * edge of the parents:
      *
-     * [header strlen=0][abc][a-ptr][b-ptr][c-ptr](value-ptr?)
+     * [header iscompr=0][abc][a-ptr][b-ptr][c-ptr](value-ptr?)
      *
-     * if node is compressed (strlen != 0) the node has 1 children.
+     * if node is compressed (iscompr bit is 1) the node has 1 child.
      * In that case the 'size' bytes of the string stored immediately at
      * the start of the data section, represent a sequence of successive
      * nodes linked one after the other, for which only the last one in
      * the sequence is actually represented as a node, and pointed to by
      * the current compressed node.
      *
-     * [header strlen=3][xyz][z-ptr](value-ptr?)
+     * [header iscompr=1][xyz][z-ptr](value-ptr?)
      *
      * Both compressed and not compressed nodes can represent a key
      * with associated data in the radix tree at any level (not just terminal
      * nodes).
      *
      * If the node has an associated key (iskey=1) and is not NULL
-     * (isnull=0), then after the raxNode pointers poiting to the
-     * childen, an additional value pointer is present (as you can see
+     * (isnull=0), then after the raxNode pointers pointing to the
+     * children, an additional value pointer is present (as you can see
      * in the representation above as "value-ptr" field).
      */
     unsigned char data[];
@@ -104,6 +124,15 @@ typedef struct rax {
     raxNode *head;
     uint64_t numele;
     uint64_t numnodes;
+    size_t *alloc_size;
+    uint32_t keyFixedLen;   /* 0 = variable-length keys (today's behavior).
+                             * >0 = all keys exactly this many bytes; set at
+                             * creation via raxNewEx() and immutable
+                             * thereafter. Enables the leaf-inlining path
+                             * (no leaf raxNode allocation). Wrong-length
+                             * inserts/removes are a programmer error
+                             * (asserted in debug). */
+    void *metadata[];
 } rax;
 
 /* Stack data structure used by raxLowWalk() in order to, optionally, return
@@ -118,6 +147,21 @@ typedef struct raxStack {
     void *static_items[RAX_STACK_STATIC_ITEMS];
     int oom; /* True if pushing into this stack failed for OOM at some point. */
 } raxStack;
+
+/* Optional callback used for iterators and be notified on each rax node,
+ * including nodes not representing keys. If the callback returns true
+ * the callback changed the node pointer in the iterator structure, and the
+ * iterator implementation will have to replace the pointer in the radix tree
+ * internals. This allows the callback to reallocate the node to perform
+ * very special operations, normally not needed by normal applications.
+ *
+ * This callback is used to perform very low level analysis of the radix tree
+ * structure, scanning each possible node (but the root node), or in order to
+ * reallocate the nodes to reduce the allocation fragmentation (this is the
+ * Redis application for this callback).
+ *
+ * This is currently only supported in forward iterations (raxNext) */
+typedef int (*raxNodeCallback)(raxNode **noderef, void *privdata);
 
 /* Radix tree iterator state is encapsulated into this data structure. */
 #define RAX_ITER_STATIC_LEN 128
@@ -135,19 +179,74 @@ typedef struct raxIterator {
     size_t key_len;         /* Current key length. */
     size_t key_max;         /* Max key len the current key buffer can hold. */
     unsigned char key_static_string[RAX_ITER_STATIC_LEN];
-    raxNode *node;          /* Current node. Only for unsafe iteration. */
+    raxNode *node;          /* Current node. Only for unsafe iteration.
+                             * When leaf_slot_idx >= 0 this is the leaf
+                             * parent of the inlined value at slot
+                             * leaf_slot_idx (no real raxNode below it). */
     raxStack stack;         /* Stack used for unsafe iteration. */
+    raxNodeCallback node_cb; /* Optional node callback. Normally set to NULL. */
+    void *privdata;         /* Optional private data for node callback. */
+    int leaf_slot_idx;      /* Fixed-length leaf inlining: -1 in normal
+                             * traversal. >= 0 means we are positioned on
+                             * a virtual leaf (the value at slot
+                             * leaf_slot_idx of `node`, which is the leaf
+                             * parent). Variable-length trees keep this
+                             * at -1 throughout. */
 } raxIterator;
 
-/* A special pointer returned for not found items. */
-extern void *raxNotFound;
+/* Result of a rax walk, used to commit a find-then-insert pair without
+ * re-walking the tree.
+ *
+ *   raxFindLink()  produces a link.
+ *   raxInsertAt()  consumes it.
+ *
+ * Invalidation contract: `stopnode` and `parentlink` are interior pointers into
+ * the tree. They become stale on ANY intervening rax mutation. Callers
+ * MUST commit (or discard) immediately after the find; do not interleave
+ * other rax calls on the same tree, do not retain across yield points.
+ * The commit itself is allowed to realloc `stopnode` (raxReallocForData,
+ * raxAddChild) and update *parentlink in-place -- the link's own fields
+ * survive the commit, but a second commit on the same link is undefined. */
+#define RAX_LEAF_PARENT_STOP (-1)  /* on fixed-len, when walk stop at a leaf parent */
+typedef struct raxNodeLink {
+    raxNode  *stopnode;     /* Stop node. */
+    raxNode **parentlink;   /* Slot in stopnode's parent that holds h. */
+    size_t    consumed;     /* Bytes of key consumed at stop. */
+    int       splitpos;     /* Split position inside stopnode's compressed
+                             * prefix. Same semantic as raxLowWalk():
+                             * only meaningful when stopnode->iscompr; 0 with
+                             * i == len means clean arrival at stopnode, 0 with
+                             * i < len means the first prefix byte
+                             * mismatched the next key byte, > 0 means
+                             * the walk stopped mid-prefix.
+                             * RAX_LEAF_PARENT_STOP is the fixed-length
+                             * leaf-parent stop sentinel (see leafSlot). */
+    int       leafSlot;     /* Fixed-length leaf-parent stop only
+                             * (splitpos == RAX_LEAF_PARENT_STOP). Index
+                             * of the inlined value slot inside h: 0 for
+                             * iscompr=1 leaf parents (single slot), the
+                             * matched edge index for iscompr=0.
+                             * RAX_LEAF_PARENT_STOP otherwise. */
+} raxNodeLink;
 
 /* Exported API. */
 rax *raxNew(void);
+rax *raxNewEx(int metaSize, size_t *alloc_size, uint32_t keyFixedLen);
 int raxInsert(rax *rax, unsigned char *s, size_t len, void *data, void **old);
+int raxTryInsert(rax *rax, unsigned char *s, size_t len, void *data, void **old);
 int raxRemove(rax *rax, unsigned char *s, size_t len, void **old);
-void *raxFind(rax *rax, unsigned char *s, size_t len);
+int raxFind(rax *rax, unsigned char *s, size_t len, void **value);
+
+int raxFindLink(rax *rax, unsigned char *s, size_t len,
+                void **value, raxNodeLink *link);
+int raxInsertAt(rax *rax, unsigned char *s, size_t len,
+                void *data, void **old, raxNodeLink *link);
+
 void raxFree(rax *rax);
+void raxFreeWithCallback(rax *rax, void (*free_callback)(void*));
+void raxFreeWithCbAndContext(rax *rax,
+                             void (*free_callback)(void *item, void *ctx),
+                             void *ctx);
 void raxStart(raxIterator *it, rax *rt);
 int raxSeek(raxIterator *it, const char *op, unsigned char *ele, size_t len);
 int raxNext(raxIterator *it);
@@ -155,6 +254,15 @@ int raxPrev(raxIterator *it);
 int raxRandomWalk(raxIterator *it, size_t steps);
 int raxCompare(raxIterator *iter, const char *op, unsigned char *key, size_t key_len);
 void raxStop(raxIterator *it);
+int raxEOF(raxIterator *it);
+void raxIteratorSetData(raxIterator *it, void *data);
 void raxShow(rax *rax);
+uint64_t raxSize(rax *rax);
+unsigned long raxTouch(raxNode *n);
+void raxSetDebugMsg(int onoff);
+
+#ifdef REDIS_TEST
+int raxTest(int argc, char *argv[], int flags);
+#endif
 
 #endif
